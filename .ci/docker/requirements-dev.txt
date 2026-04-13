@@ -1,5 +1,5 @@
 expecttest==0.1.6
-pytest==7.3.2
+pytest==9.0.3
 pytest-cov
 pre-commit
 pyrefly==0.45.1
