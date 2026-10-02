@@ -37,7 +37,10 @@ from torchtitan.models.common.config_utils import (
     make_routed_experts_config,
     make_router_config,
 )
-from torchtitan.models.common.moe import MicrobatchWiseLoadBalanceLoss
+from torchtitan.models.common.moe import (
+    GlobalBatchLoadBalanceLoss,
+    MicrobatchWiseLoadBalanceLoss,
+)
 
 _COEFF = 0.1
 _METRIC_KEY = ("dp", "microbatch_wise_load_balance_loss")
@@ -73,6 +76,23 @@ def _reference_loss(
     f_E = counts_E * (E / (top_k * T))
     p_E = probs_TE.sum(dim=0) / T
     return (f_E * p_E).sum() * T * coeff
+
+
+def _reference_global_loss(
+    scores_TE: torch.Tensor,
+    routing_map_TE: torch.Tensor,
+    global_routing_map_TE: torch.Tensor,
+    top_k: int,
+    *,
+    coeff: float = 1.0,
+) -> torch.Tensor:
+    """Global-batch reference: ``f_i`` from every DP rank's tokens
+    (``global_routing_map_TE``), ``p_i`` summed over this rank's tokens."""
+    E = scores_TE.size(-1)
+    counts_E = global_routing_map_TE.sum(dim=0).to(scores_TE.dtype)
+    f_E = counts_E * (E / (top_k * global_routing_map_TE.size(0)))
+    probs_TE = scores_TE / scores_TE.sum(dim=-1, keepdim=True)
+    return (f_E * probs_TE.sum(dim=0)).sum() * coeff
 
 
 def _routing_map(ids_TK: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -273,6 +293,62 @@ class TestMicrobatchWiseLoadBalanceLossConfig(_AuxLossTestCase):
             type(moe_cfg.router.aux_loss.build()), MicrobatchWiseLoadBalanceLoss
         )
 
+    def test_config_selects_the_global_batch_loss(self):
+        kwargs = dict(
+            num_experts=4,
+            router=make_router_config(
+                dim=8,
+                num_experts=4,
+                gate_param_init={},
+                score_func=Sigmoid.Config(),
+            ),
+            routed_experts=make_routed_experts_config(
+                dim=8,
+                hidden_dim=16,
+                num_experts=4,
+                top_k=1,
+                param_init={},
+            ),
+            load_balance_coeff=None,
+            global_batch_aux_loss=True,
+        )
+        moe_cfg = make_moe_config(**kwargs, aux_loss_coeff=_COEFF)
+        self.assertIs(type(moe_cfg.router.aux_loss.build()), GlobalBatchLoadBalanceLoss)
+        self.assertIsNone(moe_cfg.load_balance_coeff)
+        # Selecting the global-batch loss without a coefficient is an error, not a no-op.
+        with self.assertRaises(ValueError):
+            make_moe_config(**kwargs)
+
+    def test_qwen3_30b_a3b_global_lbl_recipe(self):
+        """The opt-in recipe swaps every MoE layer to the global-batch loss."""
+        from torchtitan_recipes.tests.models.qwen3 import (
+            qwen3_30b_a3b,
+            qwen3_30b_a3b_global_lbl,
+        )
+
+        moes = [l.moe for l in qwen3_30b_a3b_global_lbl().model.layers]
+        self.assertEqual(len(moes), 48)
+        for moe in moes:
+            self.assertIsNone(moe.load_balance_coeff)
+            self.assertIs(type(moe.router.aux_loss), GlobalBatchLoadBalanceLoss.Config)
+            self.assertEqual(moe.router.aux_loss.coeff, 1e-3)
+        # The default recipe keeps the expert bias and no aux loss.
+        for layer in qwen3_30b_a3b().model.layers:
+            self.assertEqual(layer.moe.load_balance_coeff, 1e-3)
+            self.assertIsNone(layer.moe.router.aux_loss)
+
+    def test_qwen3_registers_the_aux_loss_hook(self):
+        """Without the zero hook the metric reads 0 and instance_acc grows."""
+        from torchtitan.models.qwen3.model import Qwen3Model
+
+        with patch(
+            "torchtitan.models.common.aux_loss.register_aux_loss_zero_hook"
+        ) as aux_hook, patch(
+            "torchtitan.models.common.moe.register_moe_load_balancing_hook"
+        ):
+            Qwen3Model._register_optimizer_hooks("opt", ["part"], "ctx")
+        aux_hook.assert_called_once_with("opt", ["part"], "ctx")
+
 
 class TestMicrobatchWiseLossSpmdTypes(DTensorTestBase):
     """8-rank spmd_types cases: dp2/cp2/tp2 on CPU float64 + gloo.
@@ -343,7 +419,7 @@ class TestMicrobatchWiseLossSpmdTypes(DTensorTestBase):
         self.assertAlmostEqual(metrics[f"{_METRIC_KEY[1]}/mean"], 2.0, places=6)
         _clear_aux_loss_registry()
 
-    def _run_reduction_case(self, *, use_typecheck: bool):
+    def _run_reduction_case(self, *, use_typecheck: bool, global_batch: bool = False):
         """Compare one distributed layout with the per-DP-rank reference."""
         parallelism_context, dense_mesh = self._setup_mesh()
         from torchtitan.distributed.spmd_types import set_current_spmd_mesh
@@ -383,9 +459,12 @@ class TestMicrobatchWiseLossSpmdTypes(DTensorTestBase):
             spmd.assert_type(local_ids_TK, placement)
             spmd.assert_type(local_map, placement)
 
-            loss = MicrobatchWiseLoadBalanceLoss(
-                MicrobatchWiseLoadBalanceLoss.Config(coeff=_COEFF)
+            loss_cls = (
+                GlobalBatchLoadBalanceLoss
+                if global_batch
+                else MicrobatchWiseLoadBalanceLoss
             )
+            loss = loss_cls(loss_cls.Config(coeff=_COEFF))
             local_scores.requires_grad_(True)
             carrier_TK = local_scores.gather(dim=-1, index=local_ids_TK)
             out_TK = loss(local_scores, local_map, carrier=carrier_TK)
@@ -398,12 +477,21 @@ class TestMicrobatchWiseLossSpmdTypes(DTensorTestBase):
                 dp_scores = global_scores_TE[dp_start : dp_start + t_dp]
                 dp_ids_TK = global_ids_TK[dp_start : dp_start + t_dp]
                 dp_map = _routing_map(dp_ids_TK, E)
+                global_map = _routing_map(global_ids_TK, E)
+
+                def ref_fn(scores, coeff=1.0):
+                    if global_batch:
+                        return _reference_global_loss(
+                            scores, dp_map, global_map, K, coeff=coeff
+                        )
+                    return _reference_loss(scores, dp_map, K, coeff=coeff)
+
                 # The metric accumulator is float32 (the reference float64).
-                ref_raw = _reference_loss(dp_scores, dp_map, K).item()
+                ref_raw = ref_fn(dp_scores).item()
                 self.assertAlmostEqual(loss.instance_acc.item(), ref_raw, places=4)
 
                 ref_scores = dp_scores.detach().clone().requires_grad_(True)
-                ref_aux = _reference_loss(ref_scores, dp_map, K, coeff=_COEFF)
+                ref_aux = ref_fn(ref_scores, coeff=_COEFF)
                 (ref_aux + (ref_scores * dp_map).sum()).backward()
                 ref_local_grad = ref_scores.grad[shard * t_blk : (shard + 1) * t_blk]
                 self.assertLess(
@@ -418,12 +506,26 @@ class TestMicrobatchWiseLossSpmdTypes(DTensorTestBase):
         for stream in range(dp):
             stream_scores = global_scores_TE[stream * t_dp : (stream + 1) * t_dp]
             stream_ids_TK = global_ids_TK[stream * t_dp : (stream + 1) * t_dp]
-            ref_total += _reference_loss(
-                stream_scores, _routing_map(stream_ids_TK, E), K
+            stream_map = _routing_map(stream_ids_TK, E)
+            ref_total += (
+                _reference_global_loss(
+                    stream_scores, stream_map, _routing_map(global_ids_TK, E), K
+                )
+                if global_batch
+                else _reference_loss(stream_scores, stream_map, K)
             ).item()
         metrics = collect_aux_loss_metrics(parallelism_context)
-        self.assertAlmostEqual(metrics[f"{_METRIC_KEY[1]}/mean"], ref_total, places=4)
+        key = loss.metric_name
+        self.assertAlmostEqual(metrics[f"{key}/mean"], ref_total, places=4)
         _clear_aux_loss_registry()
+
+    @with_comms
+    def test_global_batch_reduction_matches_reference(self):
+        """``f_i`` comes from both DP ranks' tokens; each rank's gradient is
+        the global-count reference on its own tokens."""
+        for use_typecheck in (True, False):
+            with self.subTest(use_typecheck=use_typecheck):
+                self._run_reduction_case(use_typecheck=use_typecheck, global_batch=True)
 
     @with_comms
     def test_reduction_matches_reference(self):

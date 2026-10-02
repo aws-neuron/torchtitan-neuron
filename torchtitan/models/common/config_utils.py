@@ -34,6 +34,7 @@ from torchtitan.models.common.linear import (
     SharedExpertRowParallelLinear,
 )
 from torchtitan.models.common.moe import (
+    GlobalBatchLoadBalanceLoss,
     MicrobatchWiseLoadBalanceLoss,
     MoE,
     RoutedExperts,
@@ -314,12 +315,24 @@ def make_moe_config(
     shared_experts: FeedForward.Config | None = None,
     load_balance_coeff: float | None = 1e-3,
     aux_loss_coeff: float | None = None,
+    global_batch_aux_loss: bool = False,
 ) -> MoE.Config:
-    """Build a fully-specified MoE.Config."""
+    """Build a fully-specified MoE.Config.
+
+    ``global_batch_aux_loss`` selects ``GlobalBatchLoadBalanceLoss`` (Qwen3)
+    instead of the per-microbatch loss; Qwen3's recipe also sets
+    ``load_balance_coeff=None`` (no expert bias).
+    """
+    if global_batch_aux_loss and aux_loss_coeff is None:
+        raise ValueError("global_batch_aux_loss=True requires aux_loss_coeff")
     if aux_loss_coeff is not None:
+        loss_cls = (
+            GlobalBatchLoadBalanceLoss
+            if global_batch_aux_loss
+            else MicrobatchWiseLoadBalanceLoss
+        )
         router = dataclasses.replace(
-            router,
-            aux_loss=MicrobatchWiseLoadBalanceLoss.Config(coeff=aux_loss_coeff),
+            router, aux_loss=loss_cls.Config(coeff=aux_loss_coeff)
         )
     return MoE.Config(
         num_experts=num_experts,
