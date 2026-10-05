@@ -23,8 +23,7 @@ from torchtitan.models.common.attention import (
     create_attention_mask,
     create_varlen_metadata_for_document,
     FlexInnerAttention,
-    get_causal_mask_mod,
-    get_efficient_causal_mask_mod_for_packed_document,
+    get_flex_causal_mask_mods,
     VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
@@ -292,14 +291,12 @@ class Decoder(BaseModel):
         positions: torch.Tensor,
         attn_config: BaseAttention.Config,
     ) -> BlockMask:
-        """Build the standard causal + packed-document flex-attention mask."""
+        """Build the causal flex-attention mask selected by ``mask_type``."""
+        assert isinstance(attn_config.inner_attention, FlexInnerAttention.Config)
         return self._create_flex_attention_mask(
             positions,
             attn_config,
-            [
-                get_causal_mask_mod(),
-                get_efficient_causal_mask_mod_for_packed_document(positions),
-            ],
+            get_flex_causal_mask_mods(positions, attn_config.inner_attention),
         )
 
     def preprocess_inputs(

@@ -14,7 +14,7 @@
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, NamedTuple
+from typing import Any, ClassVar, Literal, NamedTuple
 
 import spmd_types as spmd
 import torch
@@ -63,6 +63,7 @@ __all__ = [
     "get_document_mask_mod",
     "get_efficient_causal_mask_mod_for_packed_document",
     "get_fixed_block_mask_mod",
+    "get_flex_causal_mask_mods",
     "get_sliding_window_mask_mod",
     "local_head_split",
 ]
@@ -258,6 +259,11 @@ class FlexInnerAttention(InnerAttention):
     class Config(InnerAttention.Config):
         block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
         kernel_options: dict = field(default_factory=dict)
+        mask_type: Literal["block_causal", "causal"] = "block_causal"
+        """Causal mask for the flex path. ``"block_causal"``: causal within each
+        packed document (positions reset to 0 at document starts). ``"causal"``:
+        plain causal over the whole sequence, which does not depend on
+        ``positions`` and is only correct when each sequence holds one document."""
 
     inductor_configs: ClassVar[dict[str, bool]] = {
         "wrap_inductor_compiled_regions": True,
@@ -497,6 +503,17 @@ def get_document_mask_mod(positions: torch.Tensor) -> _mask_mod_signature:
         return doc_ids[q_idx] == doc_ids[kv_idx]
 
     return document_mask
+
+
+def get_flex_causal_mask_mods(
+    positions: torch.Tensor,
+    config: FlexInnerAttention.Config,
+) -> list[_mask_mod_signature]:
+    """Return the causal mask_mods selected by ``config.mask_type``."""
+    mask_mods = [get_causal_mask_mod()]
+    if config.mask_type == "block_causal":
+        mask_mods.append(get_efficient_causal_mask_mod_for_packed_document(positions))
+    return mask_mods
 
 
 def get_efficient_causal_mask_mod_for_packed_document(
