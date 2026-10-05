@@ -31,8 +31,7 @@ from torchtitan.models.common.attention import (
     create_attention_mask,
     create_varlen_metadata_for_document,
     FlexInnerAttention,
-    get_causal_mask_mod,
-    get_efficient_causal_mask_mod_for_packed_document,
+    get_flex_causal_mask_mods,
     get_sliding_window_mask_mod,
     GQAttention,
     VarlenInnerAttention,
@@ -627,14 +626,10 @@ class MuseGlimmerModel(MultimodalModel):
                 f"sliding-window masks, got {type(inner_attn).__name__}"
             )
 
-        # Language models always use block-causal (per-document) masking: the
-        # dataloaders emit per-document positions, and the efficient packed-doc
-        # mask ANDed with the causal mask yields same-document causal attention.
+        # ``mask_type="block_causal"`` (default) yields same-document causal
+        # attention from the per-document positions the dataloaders emit.
         seq_len = positions.shape[0]
-        base_mods = [
-            get_causal_mask_mod(),
-            get_efficient_causal_mask_mod_for_packed_document(positions),
-        ]
+        base_mods = get_flex_causal_mask_mods(positions, inner_attn)
 
         # Match the base Decoder mask-building so the configured block size and
         # batch-invariance handling are honored.
