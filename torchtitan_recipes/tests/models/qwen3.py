@@ -39,6 +39,7 @@ from torchtitan.models.common.config_utils import (
     decoder_vocab_size,
     DEFAULT_DEBUG_MODEL_SEQ_LEN,
 )
+from torchtitan.models.common.moe import GlobalBatchLoadBalanceLoss
 from torchtitan.models.common.token_dispatcher import DeepEPTokenDispatcher
 
 from torchtitan.models.qwen3 import build_model_config
@@ -408,6 +409,20 @@ def qwen3_30b_a3b(seq_len: int | None = None) -> Trainer.Config:
         checkpointer=None,
         activation_checkpoint=FullAC.Config(),
     )
+
+
+def qwen3_30b_a3b_global_lbl(seq_len: int | None = None) -> Trainer.Config:
+    """``qwen3_30b_a3b`` with Qwen3's global-batch load-balancing loss.
+
+    Every MoE layer uses ``GlobalBatchLoadBalanceLoss`` (coeff 1e-3) and no
+    expert bias, as in Qwen3's recipe (https://arxiv.org/abs/2505.09388).
+    """
+    config = qwen3_30b_a3b(seq_len=seq_len)
+    for layer in config.model.layers:
+        if layer.moe is not None:
+            layer.moe.load_balance_coeff = None
+            layer.moe.router.aux_loss = GlobalBatchLoadBalanceLoss.Config(coeff=1e-3)
+    return config
 
 
 def qwen3_32b(seq_len: int | None = None) -> Trainer.Config:

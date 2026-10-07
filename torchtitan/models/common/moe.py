@@ -580,8 +580,10 @@ class MicrobatchWiseLoadBalanceLoss(AuxLoss):
             # degree and follows any masking the router applies to the map.
             # The map is cast to float before the reduction: casting a Partial
             # tensor is non-linear and rejected by spmd_types.
-            counts_E = self._reduce_token_partials(
-                routing_map_TE.to(scores_TE.dtype).sum(dim=0), axes
+            counts_E = self._balancing_counts(
+                self._reduce_token_partials(
+                    routing_map_TE.to(scores_TE.dtype).sum(dim=0), axes
+                )
             )
             f_E = F.normalize(counts_E, p=1, dim=0) * E
 
@@ -596,6 +598,48 @@ class MicrobatchWiseLoadBalanceLoss(AuxLoss):
             # Eq. 17: L_bal = sum_i f_i * p_i
             loss = (f_E * p_E).sum()
             return self.inject(loss, carrier=carrier)
+
+    def _balancing_counts(self, counts_E: torch.Tensor) -> torch.Tensor:
+        """Expert counts that define ``f_i``: this forward's token stream."""
+        return counts_E
+
+
+class GlobalBatchLoadBalanceLoss(MicrobatchWiseLoadBalanceLoss):
+    """Global-batch MoE load-balance loss (Qiu et al. 2025, used by Qwen3).
+
+    Same ``L_bal = sum_i f_i * p_i`` as ``MicrobatchWiseLoadBalanceLoss``, but
+    ``f_i`` comes from the counts of every data-parallel rank's tokens, not
+    one rank's.  ``p_i`` stays this rank's score sum: the injected gradients
+    of all DP ranks add up (the step denominator is the dp-summed token
+    count), so the step optimizes ``sum_i f_i^global * p_i^global``.
+
+    Balancing over the global batch instead of one microbatch lets experts
+    specialize on domains that are unevenly spread over sequences, which a
+    per-microbatch constraint penalizes (https://arxiv.org/abs/2501.11873).
+
+    Limitation: under gradient accumulation each microbatch uses its own
+    (DP-global) counts; accumulating counts across microbatches is not
+    implemented.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(MicrobatchWiseLoadBalanceLoss.Config):
+        """Same fields as ``AuxLoss.Config``."""
+
+    def _balancing_counts(self, counts_E: torch.Tensor) -> torch.Tensor:
+        # The counts are one-hot sums with no gradient, so a plain all-reduce
+        # over DP (outside the typechecker: DP is local here) is enough.
+        group = spmd_mesh_group("dp")
+        if group is None:
+            return counts_E
+        local_type = spmd.get_local_type(counts_E)
+        with spmd.no_typecheck():
+            global_counts_E = counts_E.detach().clone()
+            torch.distributed.all_reduce(global_counts_E, group=group)
+        # Same (Invariant) type as the per-rank counts; only the values differ.
+        if local_type is not None:
+            spmd.assert_type(global_counts_E, local_type)
+        return global_counts_E
 
 
 class MoE(Module):
