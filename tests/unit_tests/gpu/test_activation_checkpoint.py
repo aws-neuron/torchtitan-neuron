@@ -321,6 +321,67 @@ class TestApplyAC(unittest.TestCase):
         # Early-stop skips the terminal output once backward has all its tensors.
         self.assertEqual(get_recomputed(["output"]), {"wq"})
 
+    def test_matmul_recompute_freq(self):
+        """matmul_recompute_freq controls which mms are recomputed; 0 saves
+        every mm.
+
+        Same aten.mm counting approach as test_force_recompute_mm_fqns.
+        mm order in ToyModule: gate (1st), wq (2nd), output (3rd).
+        """
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        class MmWeightTracker(TorchDispatchMode):
+            def __init__(self, ptrs):
+                super().__init__()
+                self._ptrs = ptrs
+                self.counts = {n: 0 for n in ptrs.values()}
+
+            def __torch_dispatch__(self, func, types, args, kwargs=None):
+                if func == torch.ops.aten.mm.default:
+                    for arg in args:
+                        name = self._ptrs.get(arg.data_ptr())
+                        if name is not None:
+                            self.counts[name] += 1
+                            break
+                return func(*args, **(kwargs or {}))
+
+        def get_recomputed(matmul_recompute_freq):
+            m = ToyModule()
+            SelectiveAC.Config(
+                force_recompute_mm_shapes_by_fqns=[],
+                matmul_recompute_freq=matmul_recompute_freq,
+            ).build().apply(m)
+            ptr_to_name = {
+                mod.weight.data_ptr(): fqn.rsplit(".", 1)[-1]
+                for fqn, mod in m.named_modules()
+                if isinstance(mod, Linear)
+            }
+            x = torch.randn(64, 512, requires_grad=True)
+            out = m(x)
+            tracker = MmWeightTracker(ptr_to_name)
+            with tracker:
+                out.backward()
+            return {n for n, c in tracker.counts.items() if c == 2}
+
+        # Default freq=2 recomputes the 2nd mm (wq): backwards compatible.
+        self.assertEqual(get_recomputed(2), {"wq"})
+        # freq=0 saves every mm (recompute none).
+        self.assertEqual(get_recomputed(0), set())
+        # freq=1 recomputes every mm. As in test_force_recompute_mm_fqns,
+        # early-stop skips the terminal output mm, so only gate and wq are
+        # observably replayed.
+        self.assertEqual(get_recomputed(1), {"gate", "wq"})
+        # freq=3 targets the 3rd mm (output), so gate and wq are both saved:
+        # wq flips from recomputed at freq=2 to saved here.
+        self.assertEqual(get_recomputed(3), set())
+
+    def test_matmul_recompute_freq_must_be_non_negative(self):
+        with self.assertRaises(ValueError):
+            SelectiveAC.Config(
+                force_recompute_mm_shapes_by_fqns=[],
+                matmul_recompute_freq=-1,
+            ).build().apply(ToyModule())
+
 
 if __name__ == "__main__":
     unittest.main()

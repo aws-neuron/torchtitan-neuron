@@ -197,8 +197,9 @@ class SelectiveAC(ActivationCheckpointing):
 
     Saves the outputs of compute/communication ops that are expensive to
     recompute (see ``get_save_ops``) while recomputing the rest, and recomputes
-    every second matmul to balance memory and compute. Override ``get_save_ops``
-    in a subclass to tune which ops are saved.
+    every ``matmul_recompute_freq``-th matmul (default: every second) to balance
+    memory and compute. Override ``get_save_ops`` in a subclass to tune which
+    ops are saved.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -216,6 +217,17 @@ class SelectiveAC(ActivationCheckpointing):
         ANY mm with shape matching (*, in) x (in, out) will be force recomputed.
         """
 
+        matmul_recompute_freq: int = 2
+        """
+        Recompute one matmul/linear out of every ``matmul_recompute_freq`` under
+        the default SAC policy (the rest are saved). ``2`` (default) recomputes
+        every second matmul, matching the historical policy; larger values
+        recompute fewer matmuls (save more); ``0`` saves every matmul (recompute
+        none) -- used by memory-headroom configs that need all mms saved.
+        Matmuls matched by ``force_recompute_mm_shapes_by_fqns`` are always
+        recomputed regardless of this value. Must be >= 0.
+        """
+
     def get_save_ops(self) -> set:
         """Returns the set of ops whose activations should be saved. Override
         to customize the save set."""
@@ -225,6 +237,15 @@ class SelectiveAC(ActivationCheckpointing):
         self, module: nn.Module, *, base_fqn: str | None = None
     ) -> nn.Module:
         config = cast("SelectiveAC.Config", self.config)
+        # Read out as a plain int rather than referencing config inside the
+        # policy closure below: the closure is pickled by the precompile
+        # packager, and capturing the Config would drag the nested
+        # SelectiveAC.Config class into the pickle.
+        mm_recompute_freq = config.matmul_recompute_freq
+        if mm_recompute_freq < 0:
+            raise ValueError(
+                f"matmul_recompute_freq must be >= 0, got {mm_recompute_freq}"
+            )
         save_ops = self.get_save_ops()
 
         # Collect weight shapes to force-recompute, stored as mm RHS shape
@@ -281,9 +302,14 @@ class SelectiveAC(ActivationCheckpointing):
                         return CheckpointPolicy.PREFER_RECOMPUTE
                     meta[mm_count_key] += 1
 
-                # Save all compute/comm ops, except every second mm/linear.
+                # Save all compute/comm ops, except every
+                # matmul_recompute_freq-th mm/linear (freq=0 saves every mm).
                 if func in save_ops:
-                    if func in mm_ops and meta[mm_count_key] % 2 == 0:
+                    if (
+                        func in mm_ops
+                        and mm_recompute_freq != 0
+                        and meta[mm_count_key] % mm_recompute_freq == 0
+                    ):
                         return CheckpointPolicy.PREFER_RECOMPUTE
                     return CheckpointPolicy.MUST_SAVE
                 return CheckpointPolicy.PREFER_RECOMPUTE
