@@ -779,6 +779,7 @@ def test_optim_update_clips_before_parameter_update() -> None:
             ),
             parameters=[],
             optimizers=optimizers,
+            gradient_clipper=None,
         ),
     )
 
