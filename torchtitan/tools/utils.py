@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import importlib.metadata
 import logging
 import os
 import subprocess
@@ -66,7 +67,17 @@ def get_device_info() -> tuple[str, ModuleType]:
     return device_type, device_module
 
 
+def _load_device_compile_backend(device_type: str) -> None:
+    """Load an installed compile backend registered for ``device_type``."""
+    for backend in importlib.metadata.entry_points(
+        group="torchtitan.compile_backends",
+        name=device_type,
+    ):
+        torch.compiler.set_default_backend(backend.load())
+
+
 device_type, device_module = get_device_info()
+_load_device_compile_backend(device_type)
 
 
 def get_local_device() -> torch.device:

@@ -10,7 +10,11 @@ import pytest
 import torch
 
 from torchtitan.tools.garbage_collector import GarbageCollector
-from torchtitan.tools.utils import get_cuda_flash_attention_impl, get_local_device
+from torchtitan.tools.utils import (
+    _load_device_compile_backend,
+    get_cuda_flash_attention_impl,
+    get_local_device,
+)
 
 
 class _FakeDeviceModule:
@@ -19,6 +23,32 @@ class _FakeDeviceModule:
 
     def device_count(self) -> int:
         return self.num_devices
+
+
+def test_load_device_compile_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_default_backend = Mock()
+    monkeypatch.setattr(
+        torch.compiler,
+        "set_default_backend",
+        set_default_backend,
+    )
+
+    backend = Mock()
+    backend.load.return_value = "custom_device_backend"
+    entry_points = Mock(return_value=[backend])
+    monkeypatch.setattr(
+        "torchtitan.tools.utils.importlib.metadata.entry_points",
+        entry_points,
+    )
+
+    _load_device_compile_backend("custom_device")
+
+    entry_points.assert_called_once_with(
+        group="torchtitan.compile_backends",
+        name="custom_device",
+    )
+    backend.load.assert_called_once_with()
+    set_default_backend.assert_called_once_with("custom_device_backend")
 
 
 def test_gc_debug_collects_once_per_step(monkeypatch: pytest.MonkeyPatch) -> None:
