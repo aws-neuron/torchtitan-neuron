@@ -265,7 +265,6 @@ If a node does not have 8 GPUs, also adjust `--nproc_per_node` and
 | Datasets and data loading | [torchtitan/components/data](torchtitan/components/data/README.md) |
 | Checkpointing and HF conversion | [torchtitan/components/checkpointer](torchtitan/components/checkpointer/README.md) |
 | Reinforcement learning | [torchtitan/rl](torchtitan/rl/README.md) |
-| Custom device plugins | [docs/custom_device_plugins.md](docs/custom_device_plugins.md) |
 | Debugging, reproducibility, and validating numerics | [docs/debugging.md](docs/debugging.md) |
 | Validation and evaluation | [docs/evaluation.md](docs/evaluation.md) |
 | Benchmarks | [docs/benchmarks](docs/benchmarks) |

@@ -11,7 +11,7 @@ import torch
 
 from torchtitan.tools.garbage_collector import GarbageCollector
 from torchtitan.tools.utils import (
-    _load_device_compile_backend,
+    _configure_compile_backend,
     get_cuda_flash_attention_impl,
     get_local_device,
 )
@@ -25,29 +25,17 @@ class _FakeDeviceModule:
         return self.num_devices
 
 
-def test_load_device_compile_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_configure_compile_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     set_default_backend = Mock()
+    monkeypatch.setenv("TORCHTITAN_COMPILE_BACKEND", "custom_device_backend")
     monkeypatch.setattr(
         torch.compiler,
         "set_default_backend",
         set_default_backend,
     )
 
-    backend = Mock()
-    backend.load.return_value = "custom_device_backend"
-    entry_points = Mock(return_value=[backend])
-    monkeypatch.setattr(
-        "torchtitan.tools.utils.importlib.metadata.entry_points",
-        entry_points,
-    )
+    _configure_compile_backend()
 
-    _load_device_compile_backend("custom_device")
-
-    entry_points.assert_called_once_with(
-        group="torchtitan.compile_backends",
-        name="custom_device",
-    )
-    backend.load.assert_called_once_with()
     set_default_backend.assert_called_once_with("custom_device_backend")
 
 
