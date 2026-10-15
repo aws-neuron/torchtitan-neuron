@@ -143,6 +143,7 @@ def build_trainer_model(
         training=trainer_config.training,
         parallelism=parallelism,
         local_compile_regions=model_config.local_compile_regions,
+        local_compile_backend=model_config.local_compile_backend,
         activation_remat=trainer_config.activation_remat,
         dump_folder=config.dump_folder,
     )

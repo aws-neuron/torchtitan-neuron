@@ -415,7 +415,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         # TODO: apply local compile outside parallelize/pipeline (#5026 review). That needs
         # GraphTrainer to stop reading its compile config there first (apply_compile,
         # EP-overlap chunking, enable_autoparallel, GraphPP runtime); then delete this hook.
-        return {"local_compile_regions": self.model_config.local_compile_regions}
+        return {
+            "local_compile_regions": self.model_config.local_compile_regions,
+            "local_compile_backend": self.model_config.local_compile_backend,
+        }
 
     def _initialize_optim(self) -> None:
         """Construct the parameter update and its state."""

@@ -149,11 +149,11 @@ def set_determinism(
         # https://pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-        from torch.nn.attention.flex_attention import flex_attention
-
         from torchtitan.models.common.attention import FlexInnerAttention
 
         if torch.version.hip is not None:
+            from torch.nn.attention.flex_attention import flex_attention
+
             # Compiled ROCm flex attention is not deterministic.
             # Falling back to eager (non-compiled) flex_attention for determinism on ROCm.
             logger.info(
@@ -167,10 +167,6 @@ def set_determinism(
             # no options) so the regional-inductor scoop configs are preserved.
             FlexInnerAttention.inductor_configs["max_autotune"] = False
             FlexInnerAttention.inductor_configs["coordinate_descent_tuning"] = False
-            # pyrefly: ignore [no-matching-overload]
-            FlexInnerAttention._compiled_flex_attn = torch.compile(
-                flex_attention, options=FlexInnerAttention.inductor_configs
-            )
 
     if debug_config.detect_anomaly:
         logger.warning(

@@ -89,8 +89,12 @@ class BaseModel(Module, ABC):
         local_compile_regions: list[str] = field(default_factory=list)
         """``@local_compile`` regions this model compiles; ``[]`` runs them all eager.
 
-        FlexAttention manages its own compilation and is not controlled by this list.
+        Always-compiled helpers use ``local_compile_backend`` but are not controlled
+        by this list.
         """
+
+        local_compile_backend: str = "inductor"
+        """Backend for TorchTitan-owned local compile regions and helpers."""
 
         @abstractmethod
         def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
@@ -133,12 +137,16 @@ class BaseModel(Module, ABC):
         training: TrainingConfig,
         parallelism: ParallelismConfig,
         local_compile_regions: list[str],
+        local_compile_backend: str = "inductor",
         activation_remat: ActivationRematConfig | None,
         dump_folder: str,
     ) -> Self:
         """Apply the ordered model-level parallelization lifecycle."""
         # Bind local implementations early; torch.compile traces on first use.
-        apply_local_compile(local_compile_regions)
+        apply_local_compile(
+            local_compile_regions,
+            backend=local_compile_backend,
+        )
         with parallelism_context.activate_spmd():
             self._parallelize(parallelism_context)
             if activation_remat is not None:

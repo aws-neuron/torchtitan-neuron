@@ -99,6 +99,7 @@ def run_worker(args):
         training=training,
         parallelism=parallelism,
         local_compile_regions=config.local_compile_regions,
+        local_compile_backend=config.local_compile_backend,
         activation_remat=DefaultActivationRematConfig(),
         dump_folder="/tmp",
     )

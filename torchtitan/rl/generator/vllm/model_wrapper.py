@@ -368,6 +368,7 @@ class VLLMModelWrapper(Module):
             training=TrainingConfig(),
             parallelism=training_parallelism,
             local_compile_regions=self.config.local_compile_regions,
+            local_compile_backend=self.config.local_compile_backend,
             activation_remat=None,
             dump_folder="",
         )

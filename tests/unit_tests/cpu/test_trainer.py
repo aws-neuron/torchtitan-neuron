@@ -756,12 +756,29 @@ def test_graph_training_engine_rejects_local_compile_regions() -> None:
     ):
         GraphTrainingEngine(
             config,
-            model_config=SimpleNamespace(local_compile_regions=["loss"]),
+            model_config=SimpleNamespace(
+                local_compile_regions=["loss"],
+                local_compile_backend="inductor",
+            ),
             max_num_documents=None,
             output_dir="",
         )
 
     init.assert_not_called()
+
+
+def test_parallelize_compile_kwargs_include_backend() -> None:
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(
+            local_compile_regions=["loss"],
+            local_compile_backend="custom_device_backend",
+        )
+    )
+
+    assert TrainingEngine._parallelize_compile_kwargs(engine) == {
+        "local_compile_regions": ["loss"],
+        "local_compile_backend": "custom_device_backend",
+    }
 
 
 def test_optim_update_clips_before_parameter_update() -> None:

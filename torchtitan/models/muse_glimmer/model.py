@@ -370,6 +370,7 @@ class MuseGlimmerModel(MultimodalModel):
         training: TrainingConfig,
         parallelism: ParallelismConfig,
         local_compile_regions: list[str],
+        local_compile_backend: str = "inductor",
         activation_remat: ActivationRematConfig | None,
         dump_folder: str,
     ) -> MuseGlimmerModel:
@@ -384,6 +385,7 @@ class MuseGlimmerModel(MultimodalModel):
             training=training,
             parallelism=parallelism,
             local_compile_regions=local_compile_regions,
+            local_compile_backend=local_compile_backend,
             activation_remat=activation_remat,
             dump_folder=dump_folder,
         )

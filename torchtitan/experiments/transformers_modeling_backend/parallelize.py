@@ -88,6 +88,7 @@ def parallelize_hf_transformers(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     local_compile_regions: list[str],
+    local_compile_backend: str = "inductor",
     activation_remat: ActivationRematConfig | None,
     dump_folder: str,
     **kwargs: Any,
@@ -102,7 +103,10 @@ def parallelize_hf_transformers(
     5. Apply AC and FSDP
     """
     # Bind local implementations early; torch.compile traces on first use.
-    apply_local_compile(local_compile_regions)
+    apply_local_compile(
+        local_compile_regions,
+        backend=local_compile_backend,
+    )
     # Flex attention supports FSDP, TP, CP, and PP (in any combination). Under CP
     # the flex kernel's local SPMD boundary redistributes
     # k/v from seq-sharded to CP-Replicate (all-gather); see _attach_flex_kernel

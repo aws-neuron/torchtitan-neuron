@@ -236,12 +236,16 @@ class FluxModel(BaseModel):
         training: TrainingConfig,
         parallelism: ParallelismConfig,
         local_compile_regions: list[str],
+        local_compile_backend: str = "inductor",
         activation_remat: ActivationRematConfig | None,
         dump_folder: str,
     ) -> Self:
         """Apply Flux's AC-before-SPMD parallelization lifecycle."""
         # Bind local implementations early; torch.compile traces on first use.
-        apply_local_compile(local_compile_regions)
+        apply_local_compile(
+            local_compile_regions,
+            backend=local_compile_backend,
+        )
         with parallelism_context.activate_spmd():
             if activation_remat is not None:
                 # Flux saves no regions under any policy: each block is
