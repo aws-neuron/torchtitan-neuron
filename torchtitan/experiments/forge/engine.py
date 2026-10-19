@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import os
 from collections.abc import Generator
@@ -89,6 +90,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     # runtime utilities
     device: torch.device
     gc_handler: utils.GarbageCollection
+    compiled_grad_clip: dist_utils.CompiledGradClip | None
     gradient_accumulation_steps: int
     train_context: Generator[None, None, None]
     pp_has_first_stage: bool
@@ -115,6 +117,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
+        self.compiled_grad_clip = dist_utils.build_compiled_grad_clip(config.compile)
 
         # init distributed and build meshes
         dist_utils.init_distributed(

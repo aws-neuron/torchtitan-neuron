@@ -64,6 +64,14 @@ To run only the unit tests:
 pytest -s tests/unit_tests/
 ```
 
+Core attention backend selection and model registry contracts are covered by
+`tests/unit_tests/test_attn_backend.py`. These tests run on CPU and are included
+in the CPU unit-test CI job:
+
+```bash
+pytest -s tests/unit_tests/test_attn_backend.py
+```
+
 ### Running Specific Unit Test Files
 
 To run a specific test file:

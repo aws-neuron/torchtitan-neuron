@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import os
 import time
@@ -306,6 +307,7 @@ class Trainer(ForgeEngine):
             foreach=True,
             pp_mesh=parallel_dims.get_optional_mesh("pp"),
             ep_enabled=parallel_dims.ep_enabled,
+            compiled_grad_clip=self.compiled_grad_clip,
         )
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()

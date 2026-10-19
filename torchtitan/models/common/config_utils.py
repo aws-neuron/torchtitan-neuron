@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 """Shared config builder helpers for model registries.
 
@@ -23,6 +24,7 @@ from torchtitan.models.common.attention import (
     FusedQKVLinear,
     GQAttention,
     QKVLinear,
+    ScaledDotProductAttention,
     VarlenAttention,
 )
 from torchtitan.models.common.decoder import Decoder
@@ -36,9 +38,11 @@ from torchtitan.models.common.token_dispatcher import (
     HybridEPTokenDispatcher,
     LocalTokenDispatcher,
     MinimalAsyncEPTokenDispatcher,
+    NeuronEPTokenDispatcher,
 )
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
+from torchtitan.tools.logging import logger
 
 
 def decoder_vocab_size(model_spec: ModelSpec) -> int:
@@ -53,12 +57,20 @@ def get_attention_config(
 ) -> Module.Config:
     """Map backend string to an inner_attention config.
 
-    Language models always use block_causal masking (the dataloaders always
-    emit per-document positions), so every backend here is a masked attention
-    backend. ``ScaledDotProductAttention`` only supports a boolean ``is_causal``
-    flag and cannot consume per-document positions, so it is not a valid
-    language-model backend (it remains available for Flux, which builds it
-    directly).
+    Supported backends for language models:
+
+    - "flex": FlexAttention with a compiled block mask. Supports causal,
+      packed-document, and sliding-window masking.
+    - "flex_flash": FlexAttention routed to the FLASH kernel backend
+      (Hopper/Blackwell GPUs only).
+    - "varlen": FA3 varlen attention. True per-document separation via
+      cumulative sequence metadata; supports sliding windows.
+    - "sdpa": F.scaled_dot_product_attention. Only exposes a boolean
+      ``is_causal``, so packed documents in one sequence attend across
+      document boundaries (a warning is logged when this backend is built).
+
+    The gpt_oss-only "nki" backend is constructed by the gpt_oss registry
+    directly, not here.
     """
     if backend == "flex":
         return FlexAttention.Config()
@@ -75,10 +87,15 @@ def get_attention_config(
     elif backend == "varlen":
         return VarlenAttention.Config()
     elif backend == "sdpa":
-        raise ValueError(
-            "sdpa is no longer supported for language models; positions are "
-            "always available so use flex, flex_flash, or varlen."
+        # The text dataloaders always pack documents, and SDPA cannot express
+        # per-document masking, so this limitation applies to every SDPA run.
+        logger.warning(
+            "attn_backend='sdpa' cannot express per-document masking (SDPA "
+            "only exposes is_causal). Documents packed into the same sequence "
+            "will attend across document boundaries. Use 'varlen' or 'flex' "
+            "for per-document separation."
         )
+        return ScaledDotProductAttention.Config()
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -320,7 +337,11 @@ def make_token_dispatcher_config(
     - "deepep": Uses DeepEP custom kernels for H100/NVLink Switch
     - "hybridep": Uses HybridEP with TMA optimization for GB200/NVLink72
     - "minimal_async_ep": Uses MinimalAsyncEP for constrained DP>=EP
-
+    - "neuron_ep": Uses the Neuron NKI all-to-all-v kernels (permute_a2av /
+      unpermute_a2av) for EP on Trainium; falls back to local dispatch when EP=1.
+      The published packed kernels send only real per-destination rows and require
+      Trn3 LNC=2, EP >= 8, and num_local_experts == 1 (EP == num_experts).
+      Multi-local-expert regrouping is not supported.
     DeepEP/HybridEP requires installation:
     https://github.com/deepseek-ai/DeepEP
 
@@ -360,10 +381,18 @@ def make_token_dispatcher_config(
             num_experts=num_experts,
             top_k=top_k,
         )
+    elif comm_backend == "neuron_ep":
+        # Neuron NKI all-to-all-v dispatcher (permute_a2av / unpermute_a2av):
+        # packed token-major transmission for num_local_experts == 1.
+        return NeuronEPTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+        )
     else:
         raise ValueError(
             f"Unknown comm_backend: '{comm_backend}'. "
-            "Must be one of 'standard', 'deepep', 'hybridep', 'minimal_async_ep'."
+            "Must be one of 'standard', 'deepep', 'hybridep', 'minimal_async_ep', "
+            "'neuron_ep'."
         )
 
 

@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from __future__ import annotations
 
@@ -230,6 +231,7 @@ class ParallelDims:
             ["pp", "batch", "cp", "tp"]  # dataloading_mesh
             ["pp", "dp_replicate", "dp_shard", "cp", "tp"]  # full_dtensor dense_mesh
             ["pp", "dp_replicate", "fsdp", "tp"]  # legacy dense_mesh
+            ["pp", "fsdp", "dp_replicate", "tp"]  # legacy dense_mesh_fsdp_first
             ["pp", "dp", "cp", "tp"]  # spmd_types dense_mesh
             ["pp", "dp_replicate", "efsdp", "ep"]  # sparse_mesh
 
@@ -283,6 +285,7 @@ class ParallelDims:
         )
         loss_mesh = dataloading_mesh["batch", "cp"]._flatten("loss_mesh")
         spmd_dense_mesh_for_fwdbwd = None
+        dense_mesh_fsdp_first = None
         if self.spmd_backend == "full_dtensor":
             # Under full_dtensor, ``dp_shard`` and ``cp`` cannot be folded
             # together: activations carry a ``cp`` dimension, so parameters
@@ -327,6 +330,19 @@ class ParallelDims:
                 ("pp", "dp_replicate", "fsdp", "tp"),
                 (self.pp, self.dp_replicate, fsdp, self.tp),
             )
+            # Same devices as the dense mesh, but with ``fsdp`` as the outer
+            # axis and ``dp_replicate`` inner. SimpleFSDP (graph_trainer)
+            # requests this mesh via ``get_mesh(["fsdp", "dp_replicate"])`` so
+            # that DTensor's redistribute processes the ``fsdp`` reduce-scatter
+            # before the ``dp_replicate`` all-reduce in the backward pass. That
+            # ordering shards each gradient before the replicate all-reduce
+            # instead of all-reducing the full unsharded gradient (which, for a
+            # TP-sharded LM-head weight, is a large fp32 buffer that overflows HBM).
+            dense_mesh_fsdp_first = unflatten_mesh(
+                self._world_mesh,
+                ("pp", "fsdp", "dp_replicate", "tp"),
+                (self.pp, fsdp, self.dp_replicate, self.tp),
+            )
 
         full_sparse_mesh = unflatten_mesh(
             self._world_mesh,
@@ -340,6 +356,8 @@ class ParallelDims:
             "dense": full_dense_mesh_for_fsdp,
             "sparse": full_sparse_mesh,
         }
+        if dense_mesh_fsdp_first is not None:
+            self._global_meshes["dense_fsdp_first"] = dense_mesh_fsdp_first
         if spmd_dense_mesh_for_fwdbwd is not None:
             self._global_meshes["spmd_dense_for_fwdbwd"] = spmd_dense_mesh_for_fwdbwd
         if self.spmd_backend == "spmd_types" and self.ep > 1:
@@ -466,15 +484,31 @@ class ParallelDims:
         if key in self._multi_axis_meshes:
             return self._multi_axis_meshes[key]
 
+        # Only the explicit fsdp-first HSDP request -- both DP axes present with
+        # ``fsdp`` before ``dp_replicate`` -- selects the dedicated
+        # ``dense_fsdp_first`` mesh. Every other request resolves against the
+        # original meshes exactly as before, so no existing consumer's
+        # resolution depends on ``_global_meshes`` insertion order.
+        fsdp_first_mesh = self._global_meshes.get("dense_fsdp_first")
+        wants_fsdp_first = (
+            "fsdp" in dims
+            and "dp_replicate" in dims
+            and dims.index("fsdp") < dims.index("dp_replicate")
+        )
         candidates = [
-            (name, global_mesh)
-            for name, global_mesh in self._global_meshes.items()
+            global_mesh
+            for global_mesh in self._global_meshes.values()
             if global_mesh.mesh_dim_names is not None
             and set(dims).issubset(set(global_mesh.mesh_dim_names))
+            and (wants_fsdp_first or global_mesh is not fsdp_first_mesh)
         ]
         if not candidates:
             raise ValueError(f"Invalid mesh name combinations {dims}.")
-        submesh = candidates[0][1][key]
+        if wants_fsdp_first and fsdp_first_mesh in candidates:
+            chosen = fsdp_first_mesh
+        else:
+            chosen = candidates[0]
+        submesh = chosen[key]
         self._multi_axis_meshes[key] = submesh
         return submesh
 

@@ -1,13 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import sys
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import count
 
 import torch
 import torch.nn as nn
@@ -20,8 +22,12 @@ from torch.distributed._tensor import (
     Shard,
 )
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
+from torch.distributed.tensor._utils import (
+    compute_local_shape_and_global_offset,
+    compute_local_stride,
+)
 from torch.distributed.tensor.placement_types import _StridedShard, Placement
 
 from torchtitan.protocols.module import Module
@@ -79,19 +85,26 @@ def _distribute_dtensor(
             assert len(inner_spec.placements) == 1
             tensor_placement = (dp_placements[0], inner_spec.placements[0])
     elif len(dp_placements) == 2:
-        assert dp_placements[0].is_replicate() and dp_placements[1].is_shard()
-        # For HSDP + EP/TP/EP+TP
+        # HSDP + EP/TP/EP+TP. The two DP placements are one Shard and one
+        # Replicate; their order follows the DP mesh axis order, which is
+        # replicate-first for the default ``dense`` mesh and fsdp-first for the
+        # ``dense_fsdp_first`` mesh that only the llama3 SimpleFSDP path opts
+        # into. Handle either order by locating the Shard rather than assuming
+        # a fixed position.
+        assert (
+            sum(p.is_shard() for p in dp_placements) == 1
+            and sum(p.is_replicate() for p in dp_placements) == 1
+        ), f"HSDP expects one Shard and one Replicate placement, got {dp_placements}"
         assert len(inner_spec.placements) == 2 or len(inner_spec.placements) == 1
-        shard_dim = dp_placements[1].dim
+        shard_idx = 0 if dp_placements[0].is_shard() else 1
+        shard_dim = dp_placements[shard_idx].dim
         split_factor = inner_spec.num_shards_map[shard_dim]
-        tensor_placement = (
-            dp_placements[0],
-            (
-                _StridedShard(shard_dim, split_factor=split_factor)
-                if split_factor > 1
-                else dp_placements[1]
-            ),
-        ) + inner_spec.placements
+        dp_tensor_placement = list(dp_placements)
+        if split_factor > 1:
+            dp_tensor_placement[shard_idx] = _StridedShard(
+                shard_dim, split_factor=split_factor
+            )
+        tensor_placement = tuple(dp_tensor_placement) + inner_spec.placements
     else:
         raise ValueError(
             f"Unsupported placement {dp_placements} for distributing DTensor {tensor}"
@@ -100,16 +113,20 @@ def _distribute_dtensor(
     # HSDP case needs 2 placements for 2D outer_mesh
     current_placements = (Replicate(),) * len(dp_placements)
     target_placements = tuple(dp_placements)
+    # The DP mesh distributes the TP/EP-local tensor, not the global tensor.
+    local_meta = TensorMeta(
+        tensor._local_tensor.shape, tensor._local_tensor.stride(), tensor.dtype
+    )
 
     current_spec = DTensorSpec(
         mesh=outer_mesh,
         placements=current_placements,
-        tensor_meta=inner_spec.tensor_meta,
+        tensor_meta=local_meta,
     )
     target_spec = DTensorSpec(
         mesh=outer_mesh,
         placements=target_placements,
-        tensor_meta=inner_spec.tensor_meta,
+        tensor_meta=local_meta,
     )
     result_tensor = redistribute_local_tensor(
         tensor._local_tensor,
@@ -130,6 +147,10 @@ def _distribute_dtensor(
 # Cache of (original_class, param_names) -> wrapper class, so all instances
 # of the same module type share one SimpleFSDP class for torch.compile reuse.
 _wrap_class_cache: dict[tuple[type, frozenset[str]], type] = {}
+# Suffixes each wrapper class name, as upstream does: one module type can need
+# several wrappers (nn.Linear with and without a bias), and pickle resolves each
+# by name. The id depends only on wrap order, so it matches across processes.
+_wrap_class_id = count()
 
 
 def _register_parametrization(
@@ -153,7 +174,7 @@ def _register_parametrization(
         module_cls = _wrap_class_cache[cache_key]
     else:
         module_cls = type(
-            f"SimpleFSDP{module.__class__.__name__}",
+            f"SimpleFSDP{module.__class__.__name__}_{next(_wrap_class_id)}",
             (module.__class__,),
             param_name_to_property,
         )
@@ -199,10 +220,24 @@ class ReplicateComputation(Module):
                     "full_dtensor not implemented for nD parallelisms"
                 )
             dp_mesh = self.device_mesh
+            non_dp_placements = tuple(x._spec.placements[-non_dp_mesh_dims:])
+            non_dp_mesh_dim_names = tuple(
+                x._spec.mesh.mesh_dim_names[-non_dp_mesh_dims:]
+            )
+            non_dp_mesh = x._spec.mesh[non_dp_mesh_dim_names]
+            # Preserve the true TP/EP-local shape when DP shards are uneven.
+            dp_shape, _ = compute_local_shape_and_global_offset(
+                x.shape, non_dp_mesh, non_dp_placements, skip_offset=True
+            )
+            dp_stride = compute_local_stride(x.stride(), dp_shape)
             # re-wrap 2D DTensor to 1D DTensor on dp_mesh for efficient FSDP all-gather
             sharded_local_tensor = x.to_local()
             sharded_dtensor = DTensor.from_local(
-                sharded_local_tensor, dp_mesh, self.param_sharding
+                sharded_local_tensor,
+                dp_mesh,
+                self.param_sharding,
+                shape=torch.Size(dp_shape),
+                stride=dp_stride,
             )
 
             # the actual FSDP's fwd all-gather & bwd reduce-scatter
@@ -219,14 +254,12 @@ class ReplicateComputation(Module):
                 grad_placements=self.grad_placements
             )
 
-            non_dp_placements = tuple(x._spec.placements[-non_dp_mesh_dims:])
-            non_dp_mesh_dim_names = tuple(
-                x._spec.mesh.mesh_dim_names[-non_dp_mesh_dims:]
-            )
-            non_dp_mesh = x._spec.mesh[non_dp_mesh_dim_names]
-
             output = DTensor.from_local(
-                replicated_local_tensor, non_dp_mesh, non_dp_placements
+                replicated_local_tensor,
+                non_dp_mesh,
+                non_dp_placements,
+                shape=x.shape,
+                stride=x.stride(),
             )
         elif non_dp_mesh_dims == 0:
             output = x.redistribute(
@@ -272,11 +305,24 @@ def data_parallel(
     elif mode == "fully_shard":
         param_sharding = (Shard(shard_dim),)
     elif mode == "hybrid_shard":
-        # replicate inter-host, fully shard intra-host
-        param_sharding = (Replicate(), Shard(shard_dim))
         assert (
             device_mesh.ndim == 2
         ), "hybrid sharded data parallel requires 2D DeviceMesh"
+        # Place Replicate on the dp_replicate axis and Shard on the shard axis
+        # (fsdp/efsdp) by name, so the placement is correct regardless of the DP
+        # mesh axis order: replicate-first for the default ``dense`` mesh, and
+        # fsdp-first for the ``dense_fsdp_first`` mesh that only the llama3
+        # SimpleFSDP path opts into. Deriving from names avoids coupling the
+        # placement to a fixed axis order (which would silently invert sharding
+        # for a differently-ordered mesh, e.g. the MoE experts EDP mesh).
+        mesh_axis_names = device_mesh.mesh_dim_names
+        assert (
+            mesh_axis_names is not None and "dp_replicate" in mesh_axis_names
+        ), f"hybrid_shard expects a named 2D DP mesh with a dp_replicate axis, got {mesh_axis_names}"
+        param_sharding = tuple(
+            Replicate() if name == "dp_replicate" else Shard(shard_dim)
+            for name in mesh_axis_names
+        )
     else:
         raise ValueError(f"Unsupported mode {mode}")
 
@@ -297,7 +343,8 @@ def data_parallel(
                 mod.register_parameter(
                     p_name,
                     nn.Parameter(
-                        distribute_tensor_func(p, device_mesh, param_sharding)
+                        distribute_tensor_func(p, device_mesh, param_sharding),
+                        requires_grad=p.requires_grad,
                     ),
                 )
 

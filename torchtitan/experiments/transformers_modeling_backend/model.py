@@ -1,13 +1,14 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import copy
 import importlib
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 import torch
 from torch import nn
@@ -92,6 +93,22 @@ class HFTransformerModel(BaseModel):
         Uses properties to provide TorchTitan-style access while maintaining
         HuggingFace compatibility.
         """
+
+        # Ported verbatim from upstream torchtitan main, which already has it:
+        # https://github.com/pytorch/torchtitan/blob/main/torchtitan/experiments/transformers_modeling_backend/model.py#L205
+        # Redeclare PretrainedConfig dataclass fields as init=False so
+        # ``Configurable.__init_subclass__``'s keyword-only check passes under
+        # transformers v5. Drop for upstream's version at the next refresh.
+        transformers_version: str = field(init=False, default="")
+        architectures: list | None = field(init=False, default=None)
+        output_hidden_states: bool = field(init=False, default=False)
+        return_dict: bool = field(init=False, default=True)
+        dtype: str | None = field(init=False, default=None)
+        chunk_size_feed_forward: int = field(init=False, default=0)
+        is_encoder_decoder: bool = field(init=False, default=False)
+        id2label: dict | None = field(init=False, default=None)
+        label2id: dict | None = field(init=False, default=None)
+        problem_type: str | None = field(init=False, default=None)
 
         def __init__(
             self,

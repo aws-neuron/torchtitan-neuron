@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import unittest
 
@@ -313,31 +314,29 @@ class TestLossParallelCrossEntropy(DTensorTestBase):
                 ):
                     # Build global test data once, then let DTensor derive the
                     # exact local shards for TP-only and DP+TP placements.
-                    generator = torch.Generator(device=self.device_type).manual_seed(
-                        seed
-                    )
+                    # Seed a CPU generator and move to the test device: some
+                    # accelerators (e.g. neuron) do not provide a device-side
+                    # RNG generator. Determinism is preserved by the fixed seed.
+                    generator = torch.Generator().manual_seed(seed)
                     global_logits = torch.randn(
                         B,
                         L,
                         vocab_size,
-                        device=self.device_type,
                         generator=generator,
-                    )
+                    ).to(self.device_type)
                     global_labels = torch.randint(
                         0,
                         vocab_size,
                         (B, L),
-                        device=self.device_type,
                         dtype=torch.long,
                         generator=generator,
-                    )
+                    ).to(self.device_type)
                     if ignore:
                         mask = torch.rand(
                             B,
                             L,
-                            device=self.device_type,
                             generator=generator,
-                        )
+                        ).to(self.device_type)
                         global_labels[mask < 0.3] = IGNORE_INDEX
                     # distribute as DTensor; loss_parallel wrapper takes DTensors.
                     logits_dtensor = distribute_tensor(

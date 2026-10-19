@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from collections.abc import Sequence
 from typing import Any, cast
@@ -29,7 +30,37 @@ from torchtitan.models.common.attention import (
     ScaledDotProductAttention,
     VarlenAttention,
 )
+from torchtitan.models.common.rope import RoPE
 from torchtitan.tools.logging import logger
+
+
+def apply_cp_to_rope(
+    model: nn.Module,
+    cp_mesh: DeviceMesh,
+    *,
+    load_balancer_type: str | None,
+) -> None:
+    """Configure prefix RoPE caches to follow the input's CP sharding."""
+    if cp_mesh.ndim != 1 or cp_mesh.mesh_dim_names != ("cp",):
+        raise ValueError("RoPE context parallelism requires a 1D mesh named 'cp'")
+    if load_balancer_type not in (None, "headtail", "ptrr"):
+        raise ValueError(
+            f"Invalid context-parallel load balancer: {load_balancer_type}"
+        )
+    for module in model.modules():
+        if isinstance(module, RoPE):
+            if (
+                cp_mesh.size() > 1
+                and load_balancer_type == "ptrr"
+                and module.uses_prefix_cache_for_positions
+            ):
+                raise ValueError(
+                    "Prefix RoPE caches require "
+                    "context_parallel_load_balancer=None or 'headtail'"
+                )
+            module._cp_rank = cp_mesh.get_local_rank()
+            module._cp_size = cp_mesh.size()
+            module._cp_load_balancer = load_balancer_type
 
 
 def apply_cp_to_forward(
@@ -122,15 +153,14 @@ def prepare_context_parallel_input(
     """
     Shard inputs, labels, positions, and attention masks for Context Parallel.
 
-    The caller must provide ``extra_kwargs["positions"]`` before calling this
-    function.  Position resolution (per-document vs sequential) is handled
-    upstream in ``post_dataloading_process``.
+    Preserve per-document positions when provided. For loaders that omit
+    positions, create global sequential positions before sharding.
 
     Args:
         inputs: Input tensor of shape [batch_size, seq_len]
         labels: Label tensor of shape [batch_size, seq_len]
-        extra_kwargs: Dictionary containing 'positions' (required) and
-            optionally 'attention_masks' to be sharded.
+        extra_kwargs: Dictionary optionally containing 'positions' and
+            'attention_masks' to be sharded.
         cp_mesh: Device mesh for context parallel dimension
         device: Device for the tensors
         load_balancer_type: Type of load balancer to use for sharding.
@@ -144,7 +174,11 @@ def prepare_context_parallel_input(
               sharded 'attention_masks'
     """
     attention_masks = extra_kwargs.get("attention_masks", None)
-    positions = extra_kwargs["positions"]
+    positions = extra_kwargs.get("positions")
+    if positions is None:
+        positions = torch.arange(inputs.shape[1], device=device).expand(
+            inputs.shape[0], -1
+        )
     (inputs, labels, positions), attention_masks = cp_shard(
         cp_mesh,
         (inputs, labels, positions),

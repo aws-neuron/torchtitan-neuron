@@ -1,8 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
+
+# Shape suffixes: B = batch, L = sequence, N = heads, H = head dimension,
+# C = cache width (H / 2 for complex caches, 2 * H for cos/sin caches).
 
 import math
 from dataclasses import dataclass
@@ -47,6 +51,10 @@ class RoPE(Module):
     cosine/sine caches.
     """
 
+    _cp_rank: int = 0
+    _cp_size: int = 1
+    _cp_load_balancer: str | None = None
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         dim: int
@@ -64,11 +72,18 @@ class RoPE(Module):
         beta_slow: float = 1.0
         original_seq_len: int = 4096
         mscale: float = 0.0
+        use_prefix_cache_for_positions: bool = False
+        # For causal, non-packed training with sequential position IDs, build
+        # the cache from the sequence prefix instead of gathering cache rows.
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
         self.register_buffer("cache", self._precompute_cache(), persistent=False)
+
+    @property
+    def uses_prefix_cache_for_positions(self) -> bool:
+        return self.config.use_prefix_cache_for_positions
 
     def _precompute_cache(self) -> torch.Tensor:
         """Build the reusable cache for all positions up to ``max_seq_len``.
@@ -77,6 +92,41 @@ class RoPE(Module):
             RoPE cache for all valid positions.
         """
         raise NotImplementedError
+
+    def _reshape_prefix_cache(self, query_BLNH: torch.Tensor) -> torch.Tensor:
+        """Select sequential cache rows for this rank's context-parallel shard."""
+        if self._cp_size == 1:
+            return _reshape_for_broadcast(self.cache, query_BLNH.shape, None)
+        if isinstance(query_BLNH, DTensor):
+            if not isinstance(self.cache, DTensor) or not all(
+                isinstance(p, Replicate) for p in self.cache.placements
+            ):
+                raise ValueError(
+                    "DTensor queries require a replicated DTensor RoPE cache"
+                )
+            # The cache is broadcast over batch and heads, and only its
+            # sequence dimension follows the query's sharding.
+            placements = tuple(
+                p if isinstance(p, Shard) and p.dim == 1 else Replicate()
+                for p in query_BLNH.placements
+            )
+            cache_1L1C = _reshape_prefix_cache(
+                self.cache.to_local(),
+                query_BLNH.to_local(),
+                self._cp_rank,
+                self._cp_size,
+                self._cp_load_balancer,
+            )
+            return DTensor.from_local(
+                cache_1L1C, query_BLNH.device_mesh, placements, run_check=False
+            )
+        return _reshape_prefix_cache(
+            self.cache,
+            query_BLNH,
+            self._cp_rank,
+            self._cp_size,
+            self._cp_load_balancer,
+        )
 
     def _reshape_cache(
         self,
@@ -134,10 +184,15 @@ class RoPE(Module):
             self.cache = self._precompute_cache()
 
 
+@dataclass(kw_only=True, slots=True)
+class ComplexRoPEConfig(RoPE.Config):
+    pass
+
+
 class ComplexRoPE(RoPE):
-    @dataclass(kw_only=True, slots=True)
-    class Config(RoPE.Config):
-        pass
+    # Keep the public ``ComplexRoPE.Config`` API, while giving torch.compile's
+    # caching precompile guard serializer a top-level dataclass type.
+    Config = ComplexRoPEConfig
 
     def _precompute_cache(self) -> torch.Tensor:
         """Precompute complex cis values.
@@ -232,12 +287,14 @@ class ComplexRoPE(RoPE):
         Returns:
             Cache of shape ``(1 or batch, seq_len, 1, dim / 2)``.
         """
-        positions = _maybe_wrap_positions(positions, query)
-        if positions is not None:
-            _maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
         # Complex RoPE cache has width dim / 2 because each complex value
         # represents a pair of real dimensions.
         complex_query_shape = (*query.shape[:-1], query.shape[-1] // 2)
+        if self.uses_prefix_cache_for_positions:
+            return self._reshape_prefix_cache(query)
+        positions = _maybe_wrap_positions(positions, query)
+        if positions is not None:
+            _maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
         return _reshape_for_broadcast(self.cache, complex_query_shape, positions)
 
     @staticmethod
@@ -254,10 +311,15 @@ class ComplexRoPE(RoPE):
         return xq_out.type_as(query), xk_out.type_as(key)
 
 
+@dataclass(kw_only=True, slots=True)
+class CosSinRoPEConfig(RoPE.Config):
+    pass
+
+
 class CosSinRoPE(RoPE):
-    @dataclass(kw_only=True, slots=True)
-    class Config(RoPE.Config):
-        pass
+    # Keep the public ``CosSinRoPE.Config`` API, while giving torch.compile's
+    # caching precompile guard serializer a top-level dataclass type.
+    Config = CosSinRoPEConfig
 
     def _precompute_cache(self) -> torch.Tensor:
         """Precompute cos/sin values.
@@ -324,6 +386,8 @@ class CosSinRoPE(RoPE):
         Returns:
             Cache of shape ``(1 or batch, seq_len, 1, dim * 2)``.
         """
+        if self.uses_prefix_cache_for_positions:
+            return self._reshape_prefix_cache(query)
         positions = _maybe_wrap_positions(positions, query)
         if positions is not None:
             _maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
@@ -350,6 +414,40 @@ class CosSinRoPE(RoPE):
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
+
+
+@spmd.local_map(out_types={"dp": spmd.R, "cp": spmd.S(1), "tp": spmd.R})
+def _reshape_prefix_cache(
+    cache_LC: torch.Tensor,
+    query_BLNH: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+    load_balancer: str | None,
+) -> torch.Tensor:
+    """Build a broadcast cache without gathering device-side position IDs."""
+    seq_len = query_BLNH.shape[1]
+    if seq_len * cp_size > cache_LC.shape[0]:
+        raise ValueError("The context-parallel sequence exceeds the RoPE cache")
+    if load_balancer is None:
+        start = cp_rank * seq_len
+        cache_LC = cache_LC[start : start + seq_len]
+    elif load_balancer == "headtail":
+        if seq_len % 2:
+            raise ValueError(
+                "Head-tail context parallelism requires even shard lengths"
+            )
+        half = seq_len // 2
+        head = cp_rank * half
+        tail = (2 * cp_size - cp_rank - 1) * half
+        cache_LC = torch.cat(
+            (cache_LC[head : head + half], cache_LC[tail : tail + half])
+        )
+    else:
+        raise ValueError(
+            "Prefix RoPE caches require context_parallel_load_balancer=None "
+            "or 'headtail'"
+        )
+    return cache_LC.view(1, seq_len, 1, cache_LC.shape[-1])
 
 
 @spmd.local_map(out_types={"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R})

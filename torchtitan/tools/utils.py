@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import contextlib
 import gc
@@ -40,6 +41,23 @@ def has_rocm_capability(major: int, minor: int) -> bool:
     )
 
 
+def has_neuron_capability(feature: str) -> bool:
+    """Whether the current Neuron platform supports ``feature``.
+
+    Currently only ``"mxfp8"`` is a real capability, which requires trn3
+    (NeuronCore-v4) or later. Returns False off-Neuron.
+    """
+    if feature.lower() != "mxfp8":
+        logger.warning(f"Unknown neuron capability {feature} not supported")
+        return False
+    try:
+        import torch_neuronx
+
+        return torch_neuronx.utils.get_platform_target().startswith("trn3")
+    except Exception:
+        return False
+
+
 def get_device_info() -> tuple[str, ModuleType]:
     device_type = _get_available_device_type() or "cuda"
     device_module = _get_device_module(device_type)  # default device_module:torch.cuda
@@ -47,6 +65,13 @@ def get_device_info() -> tuple[str, ModuleType]:
 
 
 device_type, device_module = get_device_info()
+if device_type == "neuron":
+    # FlexAttention binds torch.compile into a class variable when its module is
+    # imported, so the Neuron default backend must be installed before model imports.
+    # TODO: Replace this import-time hook after the upstream design is approved.
+    from torchtitan_neuron.compile_backend import install_neuron_compile_backend
+
+    install_neuron_compile_backend()
 
 
 # used to avoid stragglers in garbage collection

@@ -1,14 +1,39 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import dataclasses
 import os
 
-from tests.integration_tests import OverrideDefinitions
+from tests.integration_tests import _ON_NEURON, OverrideDefinitions
+
+
+def _inject_neuron_compile_backend(
+    flavors: list[OverrideDefinitions],
+) -> list[OverrideDefinitions]:
+    """Select the Neuron compile backend without changing model recipes."""
+    injected: list[OverrideDefinitions] = []
+    for t in flavors:
+        new_variants = []
+        for variant in t.override_args:
+            args = list(variant)
+            # Place flags before the activation-checkpoint subcommand.
+            ac_idx = next(
+                (
+                    i
+                    for i, a in enumerate(args)
+                    if a.startswith("activation-checkpoint:")
+                ),
+                len(args),
+            )
+            if not any(a.startswith("--compile.backend") for a in args):
+                args.insert(ac_idx, "--compile.backend neuron")
+            new_variants.append(tuple(args))
+        injected.append(dataclasses.replace(t, override_args=tuple(new_variants)))
+    return injected
 
 
 def _is_pp_only(variant: tuple[str, ...], ngpu: int) -> bool:
@@ -344,18 +369,15 @@ def build_features_test_list() -> list[OverrideDefinitions]:
             "pp_looped_1f1b",
             ngpu=4,
         ),
-        # TODO: Disabled with the FlexAttention default (SDPA is no longer a
-        # language-model backend). Zero-bubble / multi schedules split backward
-        # and call torch's stage_backward_input, which runs
-        # _get_grad_fn_or_grad_acc (t.requires_grad) over every stage input —
+        # TODO: Disabled with the default FlexAttention backend. Zero-bubble /
+        # multi schedules split backward and call torch's stage_backward_input,
+        # which runs _get_grad_fn_or_grad_acc (t.requires_grad) over every input,
         # including the forwarded FlexAttention BlockMask, which is not a Tensor
         # ("'BlockMask' object has no attribute 'requires_grad'"). Full-backward
         # schedules (1F1B/GPipe/Interleaved1F1B) are unaffected. Re-enable once
         # stage_backward_input skips non-tensor stage inputs upstream.
-        # (VarlenAttention's tensor-based metadata would sidestep this, but
-        # varlen requires flash_attn_interface/FA3, which the core integration
-        # CI does not install; SDPA is no longer a core LM backend. So the
-        # upstream stage_backward_input fix is the path here.)
+        # SDPA avoids BlockMask but does not preserve packed-document masking,
+        # so it would change the attention semantics exercised by these tests.
         OverrideDefinitions(
             [
                 [
@@ -569,6 +591,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
             "Override: swap FeedForward with fused SwiGLU (FSDP2 + TP2)",
             "override_fused_swiglu",
             ngpu=4,
+            skip_neuron=True,
         ),
         OverrideDefinitions(
             [
@@ -583,6 +606,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
             "(FSDP2 + TP2 dense, EP4 sparse)",
             "override_fused_grouped_experts",
             ngpu=4,
+            skip_neuron=True,
         ),
         # NOTE: below are tests which require config change that cannot be done
         #       via CLI overrides, so remain llama3 specific
@@ -598,6 +622,7 @@ def build_features_test_list() -> list[OverrideDefinitions]:
             "fsdp+varlen_attn+per_op_sac",
             ngpu=4,
             skip_rocm_test=True,
+            skip_neuron=True,
         ),
         OverrideDefinitions(
             [
@@ -671,6 +696,10 @@ def build_features_test_list() -> list[OverrideDefinitions]:
         ),
     ]
 
-    return [
-        *[_enable_spmd_backend(t, "spmd_types") for t in integration_tests_flavors],
-    ]
+    # Emit the plain-backend flavors. The spmd_types wrapper
+    # (``_enable_spmd_backend``) is intentionally not applied: the default
+    # backend is onboarded, spmd_types is not yet
+    flavors = list(integration_tests_flavors)
+    if _ON_NEURON:
+        flavors = _inject_neuron_compile_backend(flavors)
+    return flavors

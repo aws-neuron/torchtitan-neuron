@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -38,6 +39,7 @@ from torchtitan.experiments.graph_trainer.registry import (
     TRACE_CALL_INPUT_PREPARERS,
     TRACE_INPUT_PREPARERS,
 )
+from torchtitan.models.common.moe import uses_global_batch_lbl
 from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 
@@ -109,6 +111,14 @@ class GraphTrainer(Trainer):
         super().__init__(config)
 
         _maybe_apply_numa_binding(self.device.index, self.device.type)
+        if any(uses_global_batch_lbl(m) for m in self.model_parts) and (
+            self.config.compile.ep_overlap.enabled
+            or self.config.compile.precompile_artifact_dir
+        ):
+            # EP overlap counts tokens per chunk; a precompiled graph lacks the token-count mesh.
+            raise ValueError(
+                "load_balancing='global_aux_loss' does not support EP overlap or precompile"
+            )
 
         # Lazy state for aot_fx_trace mode
         self._traced_step: TracedResult | None = None

@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 """
 Single-process precompile entry point for graph_trainer.
@@ -37,6 +38,7 @@ from torchtitan.experiments.graph_trainer.precompile import _FX_TRACE_ARTIFACT_K
 from torchtitan.experiments.graph_trainer.storage import DiskStorageAdapter
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.moe import uses_global_batch_lbl
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 
@@ -196,6 +198,10 @@ def _precompile_aot_fx_trace(
         precompile_fx_trace_save,
     )
     from torchtitan.experiments.graph_trainer.trainer import make_fwd_bwd_step
+
+    if uses_global_batch_lbl(model):
+        # The trainer sets the token-count mesh and step normalization after this graph is traced.
+        raise ValueError("load_balancing='global_aux_loss' does not support precompile")
 
     loss_fn = config.loss.build(compile_config=compile_config)
     _prepare_loss_for_precompile(model, loss_fn)

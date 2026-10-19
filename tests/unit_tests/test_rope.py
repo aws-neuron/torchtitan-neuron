@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import dataclasses
 import unittest
@@ -20,7 +21,14 @@ from torchtitan.models.common.rope import (
     CosSinRoPE,
     RoPE,
 )
-from torchtitan.models.qwen3_5.rope import MRoPE
+
+# qwen3_5 pulls in `fla` (flash-linear-attention), an optional dep not present
+# in every environment (e.g. the Neuron stack). Guard the import so only the
+# MRoPE test is skipped when it is missing, not the whole module.
+try:
+    from torchtitan.models.qwen3_5.rope import MRoPE
+except ModuleNotFoundError:
+    MRoPE = None
 
 
 class TestApplyRotaryEmbCosSin(unittest.TestCase):
@@ -163,6 +171,9 @@ class TestRoPEPositionBoundsCosSin(unittest.TestCase):
             self.rope(xq, xk, positions)
 
 
+@unittest.skipIf(
+    MRoPE is None, "requires 'fla' (flash-linear-attention) via the qwen3_5 model"
+)
 class TestMRoPECache(unittest.TestCase):
     def test_forward_accepts_three_axis_positions(self):
         torch.manual_seed(42)
@@ -234,6 +245,54 @@ class TestPerLayerRoPECache(unittest.TestCase):
             len({id(rope_cfg) for rope_cfg in layer_rope_cfgs}),
             len(layer_rope_cfgs),
         )
+
+
+class TestPrefixCache(unittest.TestCase):
+    def test_prefix_matches_sequential_gather_outputs_and_gradients(self):
+        torch.manual_seed(42)
+        for rope_cls in (ComplexRoPE, CosSinRoPE):
+            with self.subTest(rope=rope_cls.__name__):
+                config = rope_cls.Config(dim=8, max_seq_len=64)
+                gather = config.build()
+                prefix = dataclasses.replace(
+                    config, use_prefix_cache_for_positions=True
+                ).build()
+                query = torch.randn(2, 8, 4, 8, requires_grad=True)
+                key = torch.randn(2, 8, 2, 8, requires_grad=True)
+                query_prefix = query.detach().clone().requires_grad_()
+                key_prefix = key.detach().clone().requires_grad_()
+                positions = torch.arange(8).expand(2, -1)
+                expected = gather(query, key, positions)
+                actual = prefix(query_prefix, key_prefix, positions)
+                for output, reference in zip(actual, expected):
+                    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+                sum(output.sum() for output in expected).backward()
+                sum(output.sum() for output in actual).backward()
+                torch.testing.assert_close(
+                    query_prefix.grad, query.grad, rtol=0, atol=0
+                )
+                torch.testing.assert_close(key_prefix.grad, key.grad, rtol=0, atol=0)
+
+    def test_gather_preserves_reset_and_offset_positions(self):
+        query = torch.ones(2, 4, 2, 8)
+        key = torch.ones(2, 4, 1, 8)
+        positions = torch.tensor([[10, 11, 12, 13], [0, 1, 0, 1]])
+        for rope_cls in (ComplexRoPE, CosSinRoPE):
+            with self.subTest(rope=rope_cls.__name__):
+                config = rope_cls.Config(dim=8, max_seq_len=64)
+                rope = config.build()
+                selected_cache = rope.cache[positions].unsqueeze(2)
+                expected = rope_cls.apply_rotary_emb(query, key, selected_cache)
+                actual = rope(query, key, positions)
+                prefix = dataclasses.replace(
+                    config, use_prefix_cache_for_positions=True
+                ).build()
+                prefix_outputs = prefix(query, key, positions)
+                for output, reference, prefix_output in zip(
+                    actual, expected, prefix_outputs
+                ):
+                    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+                    self.assertFalse(torch.equal(output, prefix_output))
 
 
 class TestUpdateFromConfigSeqLenValidation(unittest.TestCase):

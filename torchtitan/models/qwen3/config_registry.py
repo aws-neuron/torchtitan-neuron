@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
@@ -250,6 +251,19 @@ def qwen3_30b_a3b() -> Trainer.Config:
         ),
         activation_checkpoint=FullAC.Config(),
     )
+
+
+def use_global_batch_lbl(config: Trainer.Config) -> Trainer.Config:
+    """Balance every MoE layer with Qwen3's global-batch load-balancing loss."""
+    assert config.model_spec is not None
+    for layer in config.model_spec.model.layers:
+        if getattr(layer, "moe", None) is not None:
+            layer.moe.load_balancing = "global_aux_loss"
+    return config
+
+
+def qwen3_30b_a3b_global_lbl() -> Trainer.Config:
+    return use_global_batch_lbl(qwen3_30b_a3b())
 
 
 def qwen3_32b() -> Trainer.Config:

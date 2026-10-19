@@ -14,10 +14,18 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
 from torch.utils.data import DataLoader
-from torchtitan.components.checkpoint import CheckpointManager, MODEL, ModelWrapper
+from torchtitan.components.checkpoint import (
+    CheckpointManager,
+    FusedQKVLoadPlanner,
+    MODEL,
+    ModelWrapper,
+)
+from torchtitan.models.common.attention import FusedQKVLinear
+from torchtitan.models.common.nn_modules import Linear
 
 
 class FakeOptimizersContainer:
@@ -322,6 +330,68 @@ class TestCheckpointManager(unittest.TestCase):
         args, kwargs = mock_load.call_args
         self.assertEqual(kwargs.get("checkpoint_id"), expected)
         self.assertTrue(res)
+        manager.close()
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    def test_model_only_load_can_stream_fused_qkv_with_one_dcp_load(self, mock_rank):
+        source = FusedQKVLinear.Config(
+            head_dim=2,
+            n_heads=4,
+            n_kv_heads=2,
+            wqkv=Linear.Config(in_features=3, out_features=16, bias=True),
+        ).build()
+        destination = FusedQKVLinear.Config(
+            head_dim=2,
+            n_heads=4,
+            n_kv_heads=2,
+            wqkv=Linear.Config(in_features=3, out_features=16, bias=True),
+        ).build()
+        with torch.no_grad():
+            source.wqkv.weight.copy_(torch.randn_like(source.wqkv.weight))
+            source.wqkv.bias.copy_(torch.randn_like(source.wqkv.bias))
+            destination.wqkv.weight.zero_()
+            destination.wqkv.bias.zero_()
+
+        checkpoint_path = os.path.join(self.test_folder, "seed", "step-0")
+        dcp.save(source.state_dict(), checkpoint_id=checkpoint_path)
+
+        cfg = self.trainer_config.checkpoint
+        cfg.folder = "checkpoints"
+        cfg.initial_load_path = checkpoint_path
+        cfg.initial_load_model_only = True
+        cfg.load_only = True
+        cfg.load_model_state_dict_with_streaming_planner = True
+
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=[destination],
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=cfg,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        with (
+            mock.patch(
+                "torchtitan.components.checkpoint.dcp.load", wraps=dcp.load
+            ) as mock_load,
+            mock.patch(
+                "torchtitan.models.common.attention.torch.cat",
+                side_effect=AssertionError(
+                    "streaming fused-QKV loading must not allocate a cat buffer"
+                ),
+            ),
+        ):
+            self.assertTrue(manager.load())
+
+        mock_load.assert_called_once()
+        self.assertIsInstance(
+            mock_load.call_args.kwargs["planner"], FusedQKVLoadPlanner
+        )
+        torch.testing.assert_close(destination.wqkv.weight, source.wqkv.weight)
+        torch.testing.assert_close(destination.wqkv.bias, source.wqkv.bias)
         manager.close()
 
     @mock.patch("torch.distributed.get_rank", return_value=0)
@@ -764,9 +834,11 @@ class TestConfigPostInit(unittest.TestCase):
     def test_valid_default_config(self):
         """Verify that default values pass initialization."""
         try:
-            CheckpointManager.Config()
+            cfg = CheckpointManager.Config()
         except Exception as e:
             self.fail(f"Default Config raised {type(e).__name__} unexpectedly!")
+
+        self.assertFalse(cfg.load_model_state_dict_with_streaming_planner)
 
     def test_sanity_and_range_checks(self):
         """Test basic field validation like empty strings and negative numbers."""
@@ -807,6 +879,15 @@ class TestConfigPostInit(unittest.TestCase):
                 initial_load_in_hf=True, initial_load_model_only=False
             )
         CheckpointManager.Config(initial_load_in_hf=True, initial_load_path=None)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "load_model_state_dict_with_streaming_planner requires load_only=True",
+        ):
+            CheckpointManager.Config(
+                load_model_state_dict_with_streaming_planner=True,
+                load_only=False,
+            )
 
         # HF quantized requires HF enabled
         with self.assertRaisesRegex(ValueError, "requires initial_load_in_hf"):
@@ -907,6 +988,34 @@ class TestModelWrapper(unittest.TestCase):
         self.assertEqual(sd2["a"].untyped_storage().data_ptr(), ptr_a)
         # ... and the in-place refresh picked up the updated parameter.
         self.assertTrue(torch.all(sd2["a"] == 1.0))
+
+    def test_cache_can_be_disabled_for_load_only(self):
+        class HookedModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(4, 2, 3))
+                self.register_state_dict_post_hook(self._split)
+
+            @staticmethod
+            def _split(module, state_dict, prefix, local_metadata):
+                w = state_dict.pop(f"{prefix}w")
+                state_dict[f"{prefix}a"] = w[:, 0].contiguous()
+
+        model = HookedModule()
+        wrapper = ModelWrapper(model, cache_state_dict=False)
+
+        sd1 = wrapper.state_dict()
+        ptr_a = sd1["a"].untyped_storage().data_ptr()
+        self.assertIsNone(wrapper.cached_state_dict)
+
+        with torch.no_grad():
+            model.w.fill_(3.0)
+
+        sd2 = wrapper.state_dict()
+        self.assertIsNot(sd2, sd1)
+        self.assertNotEqual(sd2["a"].untyped_storage().data_ptr(), ptr_a)
+        self.assertTrue(torch.all(sd2["a"] == 3.0))
+        self.assertIsNone(wrapper.cached_state_dict)
 
 
 if __name__ == "__main__":

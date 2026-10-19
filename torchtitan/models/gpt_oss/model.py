@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import dataclasses
 import math
@@ -33,6 +34,18 @@ from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
 
 
+class _ForwardOnlyScale(torch.autograd.Function):
+    """y = x * scale in forward; gradient passes through unscaled."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        return x * scale
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None
+
+
 class ScaledBiasRowwiseLinear(Linear):
     """
     Rowwise linear whose local bias contribution is scaled by TP degree.
@@ -60,7 +73,11 @@ class ScaledBiasRowwiseLinear(Linear):
             self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
         )
         bias = self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias
-        bias = bias / self.tp_degree
+        # Each TP rank adds bias/TP to its Partial output so the TP sum carries the
+        # bias exactly once. The scale must be forward-only: the bias is stored
+        # Replicate on TP and its gradient is never summed across ranks, so each
+        # rank must hold the full (identical) bias gradient, not grad/TP.
+        bias = _ForwardOnlyScale.apply(bias, 1.0 / self.tp_degree)
         return F.linear(input, weight, bias)
 
 
@@ -134,15 +151,20 @@ class Attention(BaseAttention):
 
         q, k = self.rope(q, k, positions)
 
-        output = self.inner_attention(
-            q,
-            k,
-            v,
-            attention_masks=attention_masks,
-            scale=self.softmax_scale,
-            enable_gqa=self.enable_gqa,
-            out_transform=self._apply_sinks,
-        )
+        # Upstream generic attention applies GPT-OSS sinks through out_transform.
+        # NKI consumes sinks inside the fused kernel so backward can emit grad_sinks.
+        if getattr(self.inner_attention, "uses_attention_sinks_natively", False):
+            output = self.inner_attention(q, k, v, self.sinks)
+        else:
+            output = self.inner_attention(
+                q,
+                k,
+                v,
+                attention_masks=attention_masks,
+                scale=self.softmax_scale,
+                enable_gqa=self.enable_gqa,
+                out_transform=self._apply_sinks,
+            )
 
         # Reshape and project output
         output = output.reshape(
@@ -230,7 +252,11 @@ class GptOssModel(Decoder):
             config,
             **kwargs,
         ) -> None:
-            Decoder.Config.update_from_config(self, config=config, **kwargs)
+            if self._has_dispatcherless_moe():
+                self._update_dispatcherless_moe_from_config(config=config, **kwargs)
+            else:
+                Decoder.Config.update_from_config(self, config=config, **kwargs)
+
             parallelism = config.parallelism
 
             from torchtitan.models.gpt_oss.sharding import set_gpt_oss_sharding_config
@@ -240,6 +266,87 @@ class GptOssModel(Decoder):
                 enable_sp=parallelism.enable_sequence_parallel,
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
+
+        def _has_dispatcherless_moe(self) -> bool:
+            return any(
+                layer.moe is not None
+                and not hasattr(layer.moe.experts, "token_dispatcher")
+                for layer in self.layers
+            )
+
+        def _update_dispatcherless_moe_from_config(self, *, config, **kwargs) -> None:
+            """Apply common decoder runtime updates for GPT-OSS NKI MoE.
+
+            GPT-OSS NKI experts run without a token dispatcher. Keep that
+            exception local to this model instead of weakening the common decoder
+            and minimal-async EP validation paths for all MoE models.
+            """
+            from torchtitan.config import ParallelismConfig
+            from torchtitan.trainer import Trainer
+
+            assert hasattr(config, "parallelism"), (
+                "config passed to update_from_config must provide "
+                "a parallelism field."
+            )
+            parallelism = config.parallelism
+            assert isinstance(parallelism, ParallelismConfig), (
+                "config.parallelism must be a ParallelismConfig, got "
+                f"{type(parallelism).__name__}."
+            )
+
+            if self.enable_weight_tying and parallelism.pipeline_parallel_degree > 1:
+                raise NotImplementedError(
+                    "Weight tying is not supported with Pipeline Parallel."
+                )
+
+            if parallelism.pipeline_parallel_degree > 1 and any(
+                layer.attention is not None
+                and isinstance(layer.attention.inner_attention, VarlenAttention.Config)
+                for layer in self.layers
+            ):
+                raise ValueError(
+                    "Pipeline Parallel is not compatible with VarlenAttention. "
+                    "Use a FlexAttention backend (attn_backend='flex' or "
+                    "'flex_flash') for pipelined models."
+                )
+
+            tp = parallelism.tensor_parallel_degree
+            attention = self.first_attention
+            if tp > 1 and attention is not None:
+                n_heads = attention.n_heads
+                n_kv_heads = getattr(attention, "n_kv_heads", None) or n_heads
+                if n_heads % tp != 0:
+                    raise ValueError(
+                        f"tensor_parallel_degree ({tp}) must divide "
+                        f"n_heads ({n_heads})."
+                    )
+                if n_kv_heads % tp != 0:
+                    raise ValueError(
+                        f"tensor_parallel_degree ({tp}) must divide "
+                        f"n_kv_heads ({n_kv_heads})."
+                    )
+
+            if isinstance(config, Trainer.Config):
+                debug = config.debug
+                seq_len = config.training.seq_len
+                max_seq_len = self.max_seq_len
+                if seq_len > max_seq_len:
+                    raise ValueError(
+                        f"Training sequence length {seq_len} exceeds "
+                        f"attention RoPE maximum supported sequence "
+                        f"length {max_seq_len}."
+                    )
+
+                for layer_cfg in self.layers:
+                    attention_cfg = getattr(layer_cfg, "attention", None)
+                    if attention_cfg is not None:
+                        attention_cfg.rope = dataclasses.replace(
+                            attention_cfg.rope, max_seq_len=seq_len
+                        )
+                    if hasattr(layer_cfg, "moe") and layer_cfg.moe is not None:
+                        layer_cfg.moe.router._debug_force_load_balance = (
+                            debug.moe_force_load_balance
+                        )
 
         # pyrefly: ignore [bad-override]
         def get_nparams_and_flops(

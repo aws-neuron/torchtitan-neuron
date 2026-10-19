@@ -1,11 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
+import enum
+import os
+import sys
+import tempfile
+import types
 import unittest
 from unittest import mock
+
+import torch
 
 from torchtitan.tools.profiler import Profiler
 
@@ -151,8 +159,6 @@ class TestProfilerEnabledPaths(unittest.TestCase):
         self.patcher_rank.stop()
 
     def test_build_torch_profiler_returns_active_handle(self):
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmpdir:
             profiler = Profiler(
                 Profiler.Config(
@@ -166,6 +172,126 @@ class TestProfilerEnabledPaths(unittest.TestCase):
             )
             with profiler:
                 self.assertIsNotNone(profiler.torch_profiler)
+
+    @mock.patch("torchtitan.tools.profiler.device_module.memory._record_memory_history")
+    def test_context_reuses_started_memory_profiler(self, mock_record_history):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profiler = Profiler(
+                Profiler.Config(enable_memory_snapshot=True),
+                global_step=0,
+                base_folder=tmpdir,
+            )
+            memory_profiler = profiler.start_memory_profiler()
+            with profiler as active_profiler:
+                self.assertIs(active_profiler.memory_profiler, memory_profiler)
+
+        mock_record_history.assert_called_once()
+
+
+class _FakeProfileMode(enum.Enum):
+    RUNTIME = 1
+    CPU_UTIL = 2
+    HOST_MEMORY = 3
+    DEVICE = 4
+
+
+class _FakeNeuronConfig:
+    __slots__ = ("kwargs",)
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class _FakeNeuronProfiler:
+    def __init__(self, config):
+        self.config = config
+
+    def export_trace(self, prof):  # matches torch_neuronx NeuronProfiler API
+        pass
+
+
+def _fake_torch_neuronx_profiling():
+    mod = types.ModuleType("torch_neuronx.profiling")
+    mod.NeuronConfig = _FakeNeuronConfig
+    mod.NeuronProfiler = _FakeNeuronProfiler
+    mod.ProfileMode = _FakeProfileMode
+    return mod
+
+
+class TestNeuronProfiling(unittest.TestCase):
+    """Tests for the Neuron branch of build_torch_profiler.
+
+    _enable_neuron_profiling is host-independent (it never touches real Neuron
+    hardware -- it only wires torch_neuronx.profiling into the torch profiler), so
+    these run on any CPU host with torch_neuronx.profiling mocked.
+    """
+
+    def _call(self, env):
+        profiler = Profiler(Profiler.Config(enable_profiling=True))
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        profile_kwargs: dict = {}
+        with mock.patch.dict(
+            sys.modules, {"torch_neuronx.profiling": _fake_torch_neuronx_profiling()}
+        ), mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("NEURON_PROFILE_DEVICE", None)
+            os.environ.pop("NEURON_PROFILE_NEFF_CACHE_DIR", None)
+            os.environ.pop("NEURON_PROFILE_CAPTURE_NC", None)
+            os.environ.update(env)
+            handler = profiler._enable_neuron_profiling(
+                activities, profile_kwargs, "/tmp/traces"
+            )
+        return handler, activities, profile_kwargs
+
+    def test_system_modes_default(self):
+        """Without NEURON_PROFILE_DEVICE, only system + host modes are enabled."""
+        handler, activities, kwargs = self._call(env={})
+        self.assertIsNotNone(handler)
+        self.assertIn(torch.profiler.ProfilerActivity.PrivateUse1, activities)
+        self.assertIn("experimental_config", kwargs)
+        self.assertTrue(kwargs["with_stack"])
+        cfg = kwargs["experimental_config"]
+        self.assertEqual(
+            {m.name for m in cfg.kwargs["modes"]},
+            {"RUNTIME", "CPU_UTIL", "HOST_MEMORY"},
+        )
+        self.assertEqual(cfg.kwargs["profile_output_dir"], "/tmp/traces")
+        self.assertEqual(cfg.kwargs["max_events_per_nc"], 10_000_000)
+        # Defaults to torch_neuronx's compile cache so DEVICE .ntff resolves NEFFs.
+        self.assertEqual(cfg.kwargs["neff_cache_dir"], "/tmp/neff_cache")
+        self.assertEqual(cfg.kwargs["capture_enabled_for_nc"], "0,1")
+
+    def test_device_mode_enabled_by_env(self):
+        """NEURON_PROFILE_DEVICE=1 adds the heavy DEVICE mode."""
+        _, _, kwargs = self._call(env={"NEURON_PROFILE_DEVICE": "1"})
+        cfg = kwargs["experimental_config"]
+        self.assertIn("DEVICE", {m.name for m in cfg.kwargs["modes"]})
+
+    def test_neff_cache_dir_env_override(self):
+        """NEURON_PROFILE_NEFF_CACHE_DIR overrides the default neff cache dir."""
+        _, _, kwargs = self._call(
+            env={"NEURON_PROFILE_NEFF_CACHE_DIR": "/custom/neffs"}
+        )
+        cfg = kwargs["experimental_config"]
+        self.assertEqual(cfg.kwargs["neff_cache_dir"], "/custom/neffs")
+
+    def test_capture_nc_env_override(self):
+        """NEURON_PROFILE_CAPTURE_NC overrides which NeuronCores are captured."""
+        _, _, kwargs = self._call(env={"NEURON_PROFILE_CAPTURE_NC": "0-63"})
+        cfg = kwargs["experimental_config"]
+        self.assertEqual(cfg.kwargs["capture_enabled_for_nc"], "0-63")
+
+    def test_import_failure_falls_back_to_cpu_only(self):
+        """When torch_neuronx.profiling is unavailable, returns None untouched."""
+        profiler = Profiler(Profiler.Config(enable_profiling=True))
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        profile_kwargs: dict = {}
+        with mock.patch.dict(sys.modules, {"torch_neuronx.profiling": None}):
+            handler = profiler._enable_neuron_profiling(
+                activities, profile_kwargs, "/tmp/traces"
+            )
+        self.assertIsNone(handler)
+        self.assertEqual(activities, [torch.profiler.ProfilerActivity.CPU])
+        self.assertEqual(profile_kwargs, {})
 
 
 if __name__ == "__main__":

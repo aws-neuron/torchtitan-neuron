@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from dataclasses import dataclass, field, fields
 from importlib.util import find_spec
@@ -13,7 +14,7 @@ from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.models.common.nn_modules import Linear
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import has_cuda_capability
+from torchtitan.tools.utils import has_cuda_capability, has_neuron_capability
 
 from .utils import swap_token_dispatcher
 
@@ -33,14 +34,33 @@ try:
         class Config(Linear.Config):
             """Drop-in replacement for Linear.Config that builds MXFP8Linear."""
 
-            pass
+            kernel_preference: str = "auto"
+            """
+            torchao ``KernelPreference`` name for the MXFP8 GEMMs. Kept as a
+            plain string so this config tree imports without torchao installed.
+            Resolution of ``"auto"`` is device-gated in ``__init__``.
+            """
 
         def __init__(self, config: Config):
+            from torchao.quantization.quantize_.common.kernel_preference import (
+                KernelPreference,
+            )
+
+            # "auto" resolves to the Neuron kernel on trn3, else stays AUTO. An
+            # explicit preference is honored as-is.
+            pref = config.kernel_preference
+            if pref == "auto" and has_neuron_capability("mxfp8"):
+                pref = "neuron"
+
+            if pref == "neuron" and not hasattr(KernelPreference, "NEURON"):
+                raise ValueError("missing Neuron torchao dependency")
+
             TorchAOMXFP8Linear.__init__(
                 self,
                 config.in_features,
                 config.out_features,
                 bias=config.bias,
+                kernel_preference=KernelPreference(pref),
             )
 
 except ImportError:
@@ -58,6 +78,11 @@ class MXFP8LinearConverter(QuantizationConverter):
         Only Linear.Config entries whose FQN contains a match are converted.
         If empty, all Linear modules are converted.
         """
+        kernel_preference: str = "auto"
+        """
+        torchao ``KernelPreference`` name forwarded to each converted
+        ``MXFP8Linear.Config`` (resolved in ``MXFP8Linear.__init__``).
+        """
 
     def __init__(self, config: Config):
         self.config = config
@@ -67,8 +92,10 @@ class MXFP8LinearConverter(QuantizationConverter):
                 "torchao is not installed. Please install it to use MXFP8 linear layers."
             )
 
-        if not has_cuda_capability(10, 0):
-            raise ValueError("MXFP8 is only supported on SM100 or later architectures")
+        if not (has_cuda_capability(10, 0) or has_neuron_capability("mxfp8")):
+            raise ValueError(
+                "MXFP8 is only supported on CUDA SM100 or later, or Neuron trn3 or later"
+            )
 
         if not self.config.model_compile_enabled:
             logger.warning(
@@ -86,6 +113,7 @@ class MXFP8LinearConverter(QuantizationConverter):
                     out_features=config.out_features,
                     bias=config.bias,
                     param_init=config.param_init,
+                    kernel_preference=self.config.kernel_preference,
                 )
                 if parent is None:
                     model_config = new_config

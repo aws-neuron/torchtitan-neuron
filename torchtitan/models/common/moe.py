@@ -1,17 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import cast, Literal, Protocol
 
 import spmd_types as spmd
-
 import torch
+import torch.distributed._functional_collectives as funcol
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_mesh_size
@@ -21,6 +23,7 @@ from torchtitan.models.common.nn_modules import Linear
 from torchtitan.protocols.module import Module
 
 from .token_dispatcher import DeepEPTokenDispatcher, LocalTokenDispatcher
+
 
 # Shape suffix legend
 # (https://medium.com/@NoamShazeer/shape-suffixes-good-coding-style-f836e72e24fd):
@@ -350,6 +353,9 @@ class MoE(Module):
         experts: GroupedExperts.Config
         router: TokenChoiceTopKRouter.Config
         load_balance_coeff: float | None = 1e-3
+        # "expert_bias": aux-loss-free bias (default). "global_aux_loss": Qwen3's global-batch
+        # load-balancing loss with coefficient load_balance_coeff (see attach_global_batch_lbl).
+        load_balancing: Literal["expert_bias", "global_aux_loss"] = "expert_bias"
         shared_experts: FeedForward.Config | None = None
         # TODO(pianpwk): Remove this once MoE combine can derive the local
         # sequence shape directly from the input layout.
@@ -371,8 +377,15 @@ class MoE(Module):
         #       expert_bias_E is updated outside the model in an optimizer step pre hook
         #       to work with gradient accumulation.
         self.load_balance_coeff = config.load_balance_coeff
+        self.load_balancing = config.load_balancing
+        if self.load_balancing not in ("expert_bias", "global_aux_loss"):
+            raise ValueError(f"unknown load_balancing {self.load_balancing!r}")
+        # Set by the trainer for the global-batch loss (see attach_global_batch_lbl).
+        self.lbl_batch_mesh: DeviceMesh | None = None
+        self.lbl_num_microbatches: int = 1
         if self.load_balance_coeff is not None:
             assert self.load_balance_coeff > 0.0
+        if self.load_balance_coeff is not None and self.load_balancing == "expert_bias":
             self.register_buffer(
                 "expert_bias_E",
                 torch.zeros(num_experts, dtype=torch.float32),
@@ -463,6 +476,11 @@ class MoE(Module):
         #       effect on the expert bias update thanks to the torch.sign() operator.
         with torch.no_grad():
             self.tokens_per_expert_E.add_(num_local_tokens_per_expert_E)
+        lbl = (
+            self.load_balancing == "global_aux_loss"
+            and self.load_balance_coeff is not None
+            and torch.is_grad_enabled()
+        )
 
         out_BLD = self.experts(
             x_BLD,
@@ -507,6 +525,14 @@ class MoE(Module):
             # Drop the tokens padded on for SP sharding, restoring (B, L, D).
             out_BLD = out_BLD[:, : L - seq_pad, :]
         # ---------------------------------------------------------------------
+        if lbl:
+            out_BLD = attach_global_batch_lbl(
+                out_BLD,
+                num_local_tokens_per_expert_E,
+                scores_BLE.sum(dim=(0, 1)),
+                self,
+                top_k=self.router.top_k,
+            )
         return out_BLD
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
@@ -519,7 +545,91 @@ class MoE(Module):
             self.tokens_per_expert_E = torch.zeros(
                 self.experts.num_experts, dtype=torch.float32
             )
-            if self.load_balance_coeff is not None:
+            if self.expert_bias_E is not None:
                 self.expert_bias_E = torch.zeros(
                     self.experts.num_experts, dtype=torch.float32
                 )
+
+
+class _AttachAuxLoss(torch.autograd.Function):
+    """Identity on ``x``; backward seeds ``aux`` with 1 inside the caller's own backward."""
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def forward(ctx, x, aux):
+        ctx.save_for_backward(aux)
+        return x
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def backward(ctx, grad_x):
+        (aux,) = ctx.saved_tensors
+        return grad_x, torch.ones_like(aux)
+
+
+def uses_global_batch_lbl(model: nn.Module) -> bool:
+    return any(
+        getattr(m, "load_balancing", None) == "global_aux_loss"
+        and m.load_balance_coeff is not None
+        for m in model.modules()
+    )
+
+
+class _GlobalBatchLBLModule(Protocol):
+    """The state ``attach_global_batch_lbl`` reads from an MoE layer (MoE or a backend MoE)."""
+
+    load_balance_coeff: float | None
+    lbl_batch_mesh: DeviceMesh | None
+    lbl_num_microbatches: int
+
+
+def configure_global_batch_lbl(
+    model_parts: list[nn.Module],
+    *,
+    batch_mesh: DeviceMesh | None,
+    num_forwards: int,
+) -> None:
+    """Give each global-batch-LBL MoE its token-count group and the step's forward count."""
+    for part in model_parts:
+        for m in part.modules():
+            if getattr(m, "load_balancing", None) == "global_aux_loss":
+                lbl_module = cast(_GlobalBatchLBLModule, m)
+                lbl_module.lbl_batch_mesh = batch_mesh
+                lbl_module.lbl_num_microbatches = num_forwards
+
+
+def attach_global_batch_lbl(
+    x: torch.Tensor,
+    counts_E: torch.Tensor,
+    prob_mass_E: torch.Tensor,
+    moe: _GlobalBatchLBLModule,
+    *,
+    top_k: int,
+) -> torch.Tensor:
+    """Attach Qwen3's global-batch load-balancing loss (arXiv 2501.11873) to ``x``.
+
+    ``coeff * E * sum_i f_i * P_i``: ``f_i`` from token counts summed over every rank holding
+    distinct tokens (``moe.lbl_batch_mesh``), ``P_i`` this rank's probability mass over the step's
+    global token count, so ranks sum to the global-batch loss and micro-batches share the step's
+    normalization like the main loss.
+    The token count is every routed token, as in Megatron's aux loss (with masked labels it exceeds
+    the main loss's valid-token count). It is attached rather than added to the main loss so its gradient flows inside this layer's
+    backward: a loss-level term reaches every layer at once and, under activation checkpointing,
+    recomputes every block at once (2x peak memory). Each micro-batch uses its own global counts
+    (Megatron's running mean is a follow-up).
+    """
+    counts_E, prob_mass_E = (
+        t.full_tensor() if isinstance(t, DTensor) else t
+        for t in (counts_E.detach().float(), prob_mass_E)
+    )
+    if moe.lbl_batch_mesh is not None:
+        counts_E = funcol.all_reduce(counts_E, "sum", moe.lbl_batch_mesh)
+    global_tokens = counts_E.sum() / top_k * moe.lbl_num_microbatches
+    assert moe.load_balance_coeff is not None
+    aux = (
+        moe.load_balance_coeff
+        * counts_E.numel()
+        * (counts_E / counts_E.sum() * prob_mass_E).sum()
+        / global_tokens
+    )
+    return _AttachAuxLoss.apply(x, aux)

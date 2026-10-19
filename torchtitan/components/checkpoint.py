@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from __future__ import annotations
 
@@ -21,9 +22,19 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed.checkpoint import HuggingFaceStorageWriter
+from torch.distributed.checkpoint import DefaultLoadPlanner, HuggingFaceStorageWriter
 from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
+)
+from torch.distributed.checkpoint.default_planner import create_default_local_load_plan
+from torch.distributed.checkpoint.metadata import (
+    ChunkStorageMetadata,
+    Metadata,
+    TensorStorageMetadata,
+)
+from torch.distributed.checkpoint.planner import LoadPlan, ReadItem
+from torch.distributed.checkpoint.planner_helpers import (
+    create_read_items_for_chunk_list,
 )
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict_saver import (
@@ -37,6 +48,7 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
+from torchtitan.protocols.checkpoint_load import FusedQKVLoadTarget, plan_fused_qkv_load
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
@@ -97,15 +109,22 @@ class ModelWrapper(Stateful):
         cache will become stale.
     """
 
-    def __init__(self, model: nn.Module | list[nn.Module]) -> None:
+    def __init__(
+        self, model: nn.Module | list[nn.Module], *, cache_state_dict: bool = True
+    ) -> None:
         self.model = [model] if isinstance(model, nn.Module) else model
-        self.cached_state_dict = self._get_state_dict()
+        self.cache_state_dict = cache_state_dict
+        self.cached_state_dict = self._get_state_dict() if cache_state_dict else None
 
     def _get_state_dict(self) -> dict[str, Any]:
         # TorchTitan already makes model state_dict keys canonical.
         return {k: v for model in self.model for k, v in model.state_dict().items()}
 
     def state_dict(self) -> dict[str, Any]:
+        if not self.cache_state_dict:
+            return self._get_state_dict()
+
+        assert self.cached_state_dict is not None
         # Recompute the state dict so hook-produced tensors reflect the current
         # parameters, then merge into the cache without changing storage objects.
         for key, value in self._get_state_dict().items():
@@ -126,7 +145,211 @@ class ModelWrapper(Stateful):
         for model in self.model:
             model.load_state_dict(state_dict, strict=False)
         # Refresh the cache so state_dict() reflects the freshly loaded values.
-        self.cached_state_dict = self._get_state_dict()
+        self.cached_state_dict = (
+            self._get_state_dict() if self.cache_state_dict else None
+        )
+
+
+class FusedQKVLoadPlanner(DefaultLoadPlanner):
+    """Stream checkpoint Q/K/V tensors directly into their fused runtime tensor."""
+
+    def __init__(self) -> None:
+        super().__init__(flatten_state_dict=False, flatten_sharded_tensors=False)
+        self.targets: dict[str, FusedQKVLoadTarget] = {}
+
+    def set_up_planner(
+        self,
+        state_dict: dict[str, Any],
+        metadata: Metadata | None = None,
+        is_coordinator: bool = False,
+    ) -> None:
+        # Do not call DefaultLoadPlanner.set_up_planner(): it materializes meta
+        # tensors before reading. FusedQKVLoadTarget deliberately carries only
+        # shape/layout metadata so all Q/K/V device buffers are not allocated at
+        # once before DCP starts streaming reads.
+        self.original_state_dict = state_dict
+        self.state_dict = state_dict
+        self.metadata = metadata
+        self.is_coordinator = is_coordinator
+        self.targets = {
+            key: value
+            for key, value in state_dict.items()
+            if isinstance(value, FusedQKVLoadTarget)
+        }
+
+    def create_local_plan(self) -> LoadPlan:
+        if self.metadata is None:
+            raise AssertionError("FusedQKVLoadPlanner metadata is not initialized.")
+
+        regular_state_dict = {
+            key: value
+            for key, value in self.state_dict.items()
+            if not isinstance(value, FusedQKVLoadTarget)
+        }
+        regular_plan = create_default_local_load_plan(
+            regular_state_dict, self.metadata, strict=True
+        )
+        requests = list(regular_plan.items)
+
+        for fqn, target in self.targets.items():
+            if fqn not in self.metadata.state_dict_metadata:
+                raise RuntimeError(f"Missing key in checkpoint state_dict: {fqn}.")
+            checkpoint_metadata = self.metadata.state_dict_metadata[fqn]
+            if not isinstance(checkpoint_metadata, TensorStorageMetadata):
+                raise ValueError(
+                    f"Expected tensor checkpoint metadata for {fqn}, "
+                    f"found {type(checkpoint_metadata)}."
+                )
+            if checkpoint_metadata.size != target.shape:
+                raise ValueError(
+                    f"Size mismatch between saved {checkpoint_metadata.size} and "
+                    f"current: {target.shape} for {fqn}"
+                )
+
+            requests.extend(
+                create_read_items_for_chunk_list(
+                    fqn,
+                    checkpoint_metadata,
+                    [
+                        ChunkStorageMetadata(
+                            offsets=torch.Size([0] * len(target.shape)),
+                            sizes=target.shape,
+                        )
+                    ],
+                )
+            )
+
+        return LoadPlan(requests)
+
+    def resolve_tensor(self, read_item: ReadItem) -> torch.Tensor:
+        target = self.targets.get(read_item.dest_index.fqn)
+        if target is None:
+            return super().resolve_tensor(read_item)
+
+        fused_tensor = target.fused_tensor
+        local_tensor = (
+            fused_tensor._local_tensor
+            if isinstance(fused_tensor, DTensor)
+            else fused_tensor
+        )
+        return torch.empty(
+            read_item.lengths,
+            dtype=target.dtype,
+            device=local_tensor.device,
+        )
+
+    @staticmethod
+    def _local_fused_tensor(
+        target: FusedQKVLoadTarget,
+    ) -> tuple[torch.Tensor, torch.Size, torch.Size]:
+        fused_tensor = target.fused_tensor
+        if isinstance(fused_tensor, DTensor):
+            chunks = fused_tensor.__create_chunk_list__()
+            if len(chunks) != 1:
+                raise RuntimeError(
+                    "FusedQKVLoadPlanner expects one local DTensor chunk, "
+                    f"found {len(chunks)}."
+                )
+            chunk = chunks[0]
+            return fused_tensor._local_tensor, chunk.offsets, chunk.sizes
+
+        shape = fused_tensor.shape
+        return (
+            fused_tensor,
+            torch.Size([0] * len(shape)),
+            torch.Size(shape),
+        )
+
+    @staticmethod
+    def _copy_projection_chunk(
+        target: FusedQKVLoadTarget,
+        read_item: ReadItem,
+        tensor: torch.Tensor,
+    ) -> None:
+        (
+            local_fused,
+            local_offsets,
+            local_sizes,
+        ) = FusedQKVLoadPlanner._local_fused_tensor(target)
+        ndim = len(target.shape)
+        chunk_offsets = read_item.dest_index.offset or torch.Size([0] * ndim)
+        source_offsets = torch.Size(
+            chunk_offsets[dim] + read_item.dest_offsets[dim] for dim in range(ndim)
+        )
+
+        source_row_start = source_offsets[0]
+        source_row_end = source_row_start + read_item.lengths[0]
+        local_row_start = local_offsets[0]
+        local_row_end = local_row_start + local_sizes[0]
+
+        if ndim == 2:
+            source_col_start = source_offsets[1]
+            source_col_end = source_col_start + read_item.lengths[1]
+            local_col_start = local_offsets[1]
+            local_col_end = local_col_start + local_sizes[1]
+            copy_col_start = max(source_col_start, local_col_start)
+            copy_col_end = min(source_col_end, local_col_end)
+            if copy_col_start >= copy_col_end:
+                return
+        else:
+            source_col_start = local_col_start = copy_col_start = 0
+            copy_col_end = 0
+
+        projection_rows = (
+            target.heads_per_kv * target.head_dim
+            if target.projection == "q"
+            else target.head_dim
+        )
+        projection_fused_offset = {
+            "q": 0,
+            "k": target.heads_per_kv * target.head_dim,
+            "v": (target.heads_per_kv + 1) * target.head_dim,
+        }[target.projection]
+        fused_group_rows = (target.heads_per_kv + 2) * target.head_dim
+
+        for group in range(target.n_kv_heads):
+            projection_group_start = group * projection_rows
+            projection_group_end = projection_group_start + projection_rows
+            copy_source_start = max(source_row_start, projection_group_start)
+            copy_source_end = min(source_row_end, projection_group_end)
+            if copy_source_start >= copy_source_end:
+                continue
+
+            fused_start = (
+                group * fused_group_rows
+                + projection_fused_offset
+                + copy_source_start
+                - projection_group_start
+            )
+            fused_end = fused_start + copy_source_end - copy_source_start
+
+            clipped_fused_start = max(fused_start, local_row_start)
+            clipped_fused_end = min(fused_end, local_row_end)
+            if clipped_fused_start >= clipped_fused_end:
+                continue
+
+            clipped_source_start = copy_source_start + clipped_fused_start - fused_start
+            row_count = clipped_fused_end - clipped_fused_start
+            source_row_offset = clipped_source_start - source_row_start
+            local_row_offset = clipped_fused_start - local_row_start
+
+            source_view = tensor.narrow(0, source_row_offset, row_count)
+            target_view = local_fused.narrow(0, local_row_offset, row_count)
+            if ndim == 2:
+                col_count = copy_col_end - copy_col_start
+                source_view = source_view.narrow(
+                    1, copy_col_start - source_col_start, col_count
+                )
+                target_view = target_view.narrow(
+                    1, copy_col_start - local_col_start, col_count
+                )
+            target_view.copy_(source_view)
+
+    def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
+        target = self.targets.get(read_item.dest_index.fqn)
+        if target is None:
+            return super().commit_tensor(read_item, tensor)
+        self._copy_projection_chunk(target, read_item, tensor)
 
 
 class Terminate:
@@ -372,6 +595,15 @@ class CheckpointManager(Configurable):
         checkpoints to be loaded without saving any during the training.
         """
 
+        load_model_state_dict_with_streaming_planner: bool = False
+        """
+        Load native DCP model-only checkpoints with one DCP call while streaming
+        checkpoint-facing Q/K/V tensors directly into FusedQKVLinear's fused
+        parameter. Requires load_only=True so ModelWrapper does not materialize
+        checkpoint-facing Q/K/V tensors for its save-oriented state-dict cache.
+        Other checkpoint formats continue to use the standard load path.
+        """
+
         def __post_init__(self):
             if not self.folder.strip():
                 raise ValueError("The 'folder' field cannot be empty.")
@@ -404,6 +636,11 @@ class CheckpointManager(Configurable):
                 )
             if self.last_save_in_hf and not self.last_save_model_only:
                 raise ValueError("last_save_in_hf requires last_save_model_only=True.")
+            if self.load_model_state_dict_with_streaming_planner and not self.load_only:
+                raise ValueError(
+                    "load_model_state_dict_with_streaming_planner requires "
+                    "load_only=True."
+                )
 
             async_lowered = self.async_mode.lower()
             if async_lowered in ("disabled", "async", "async_with_pinned_mem"):
@@ -445,7 +682,7 @@ class CheckpointManager(Configurable):
         self.states = states
         self.states.update(
             {
-                MODEL: ModelWrapper(model_parts),
+                MODEL: ModelWrapper(model_parts, cache_state_dict=not config.load_only),
                 OPTIMIZER: optimizers,
                 DATALOADER: dataloader,
                 LR_SCHEDULER: lr_schedulers,
@@ -454,6 +691,9 @@ class CheckpointManager(Configurable):
 
         # Loading & Saving Policy
         self.load_only = config.load_only
+        self.load_model_state_dict_with_streaming_planner = (
+            config.load_model_state_dict_with_streaming_planner
+        )
         self.exclude_from_loading = config.exclude_from_loading
         self.initial_load_path = config.initial_load_path
         self.initial_load_model_only = config.initial_load_model_only
@@ -670,6 +910,48 @@ class CheckpointManager(Configurable):
             if MODEL in self.states:
                 self.states[MODEL].load_state_dict(state_dict)
 
+    def dcp_load_model_state_dict_with_streaming_planner(
+        self, checkpoint_id: str
+    ) -> bool:
+        """Load fused QKV checkpoint tensors with one DCP planner invocation."""
+        wrapper = cast(ModelWrapper, self.states[MODEL])
+        with plan_fused_qkv_load():
+            state_dict = {
+                key: value
+                for model in wrapper.model
+                for key, value in model.state_dict().items()
+            }
+
+        if not any(
+            isinstance(value, FusedQKVLoadTarget) for value in state_dict.values()
+        ):
+            logger.warning(
+                "Streaming checkpoint load found no FusedQKVLinear targets; "
+                "falling back to standard checkpoint loading."
+            )
+            return False
+
+        logger.info("Loading model checkpoint with the fused-QKV streaming planner.")
+        dcp.load(
+            state_dict,
+            checkpoint_id=checkpoint_id,
+            planner=FusedQKVLoadPlanner(),
+        )
+
+        # Ordinary entries either alias live parameters or need their normal module
+        # load hook. Remove Q/K/V metadata targets so FusedQKVLinear's merge hook
+        # cannot allocate the cat buffer that the planner intentionally avoids.
+        state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if not isinstance(value, FusedQKVLoadTarget)
+        }
+        for model in wrapper.model:
+            model.load_state_dict(state_dict, strict=False)
+
+        logger.info("Finished fused-QKV streaming model checkpoint load.")
+        return True
+
     @sl.log_trace_span("checkpoint_save")
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> bool:
@@ -864,13 +1146,26 @@ class CheckpointManager(Configurable):
         logger.info(f"Loading the checkpoint from {checkpoint_id}.")
         begin = time.monotonic()
 
-        states = self._states_to_load(model_only)
-        self.dcp_load(
-            states,
-            checkpoint_id=checkpoint_id,
-            from_hf=from_hf,
-            from_quantized=from_quantized,
-        )
+        loaded_with_streaming_planner = False
+        if self.load_model_state_dict_with_streaming_planner and model_only:
+            if from_hf or from_quantized:
+                logger.warning(
+                    "checkpoint.load_model_state_dict_with_streaming_planner is only "
+                    "supported for native DCP loads; falling back to standard load."
+                )
+            else:
+                loaded_with_streaming_planner = (
+                    self.dcp_load_model_state_dict_with_streaming_planner(checkpoint_id)
+                )
+
+        if not loaded_with_streaming_planner:
+            states = self._states_to_load(model_only)
+            self.dcp_load(
+                states,
+                checkpoint_id=checkpoint_id,
+                from_hf=from_hf,
+                from_quantized=from_quantized,
+            )
 
         GarbageCollection.collect("GC collection for checkpoint loading.")
         logger.info(

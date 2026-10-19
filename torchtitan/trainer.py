@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import dataclasses
 import json
@@ -44,10 +45,17 @@ from torchtitan.distributed.activation_checkpoint import (
     MemoryBudgetAC,
     SelectiveAC,
 )
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.distributed.context_parallel import (
+    apply_cp_to_rope,
+    prepare_context_parallel_input,
+)
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.moe import (
+    configure_global_batch_lbl,
+    uses_global_batch_lbl,
+)
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
@@ -210,7 +218,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     # runtime utilities
     device: torch.device
     gc_handler: utils.GarbageCollection
+    profiler: Profiler
     train_context: dist_utils.SpmdContext
+    compiled_grad_clip: dist_utils.CompiledGradClip | None = None
     gradient_accumulation_steps: int
     pp_has_first_stage: bool
     pp_has_last_stage: bool
@@ -235,6 +245,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
+        self.compiled_grad_clip = dist_utils.build_compiled_grad_clip(config.compile)
 
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()
@@ -301,6 +312,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         ):
             model = model_config.build()
 
+        if parallel_dims.cp_enabled:
+            apply_cp_to_rope(
+                model,
+                parallel_dims.get_mesh("cp"),
+                load_balancer_type=config.parallelism.context_parallel_load_balancer,
+            )
+
         # Verify all submodules satisfy the Module protocol
         # TODO: move this to module validate().
         # This is current put here to verify module build and
@@ -366,6 +384,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             config.training.local_batch_size * batch_degree
         )
         assert self.gradient_accumulation_steps > 0
+
+        if parallel_dims.spmd_backend != "default" and uses_global_batch_lbl(model):
+            # full_dtensor would double-reduce DP/CP counts; spmd_types is not validated for this loss.
+            raise ValueError(
+                "load_balancing='global_aux_loss' needs spmd_backend='default'"
+            )
+
+        self.profiler = config.profiler.build(
+            global_step=0,
+            base_folder=config.dump_folder,
+        )
+        if config.profiler.enable_memory_snapshot:
+            self.profiler.start_memory_profiler()
 
         # apply parallelisms and initialization
         with sl.log_trace_span("model_parallelism_init"):
@@ -435,6 +466,34 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 model.train()
 
                 self.model_parts = [model]
+
+        # Global-batch load balancing: every MoE counts tokens over the ranks holding distinct tokens
+        # and shares the step's normalization over all its forwards (gradient accumulation x PP
+        # micro-batches), as the main loss does through global_valid_tokens.
+        num_forwards = self.gradient_accumulation_steps * (
+            config.training.local_batch_size
+            // config.parallelism.pipeline_parallel_microbatch_size
+            if parallel_dims.pp_enabled
+            else 1
+        )
+        configure_global_batch_lbl(
+            self.model_parts,
+            batch_mesh=parallel_dims.get_optional_mesh("loss"),
+            num_forwards=num_forwards,
+        )
+
+        # Modules carrying weight-derived state that must be rebuilt after
+        # init_weights, after checkpoint load, and after each optimizer step (e.g.
+        # MXFP8 pre-quantized SimpleFSDP weights). Duck-typed so core stays
+        # device-agnostic; the model config decides whether any such module exists.
+        # Must prime after init_weights (shards hold real data), before first forward.
+        self._weight_derived_state_modules = [
+            module
+            for part in self.model_parts
+            for module in part.modules()
+            if hasattr(module, "refresh_weight_derived_state")
+        ]
+        self._refresh_weight_derived_state()
 
         # Set lm_head reference for ChunkedLossWrapper after model construction.
         # Non-PP: single model part always has lm_head.
@@ -755,6 +814,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
 
+    def _refresh_weight_derived_state(self) -> None:
+        """Rebuild any per-module weight-derived state (no-op when none exists)."""
+        for module in getattr(self, "_weight_derived_state_modules", ()):
+            module.refresh_weight_derived_state()
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -809,10 +873,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 foreach=True,
                 pp_mesh=parallel_dims.get_optional_mesh("pp"),
                 ep_enabled=parallel_dims.ep_enabled,
+                compiled_grad_clip=self.compiled_grad_clip,
             )
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
             self.lr_schedulers.step()
+
+            # Not an optimizer post-hook: reaching for the full weight there would
+            # all-gather bf16 on a schedule the compiled graph does not expect.
+            self._refresh_weight_derived_state()
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
@@ -881,15 +950,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         sl.log_trace_instant("training_start")
 
+        profiler = self.profiler
+        profiler.active(global_step=self.step, base_folder=config.dump_folder)
+
         self.checkpointer.load(step=config.checkpoint.load_step)
+
+        # Loading replaces the weights the __init__ priming described. Without this,
+        # step 1 alone runs on pre-checkpoint encodings.
+        self._refresh_weight_derived_state()
 
         # Capture loaded step for relative_step calculation.
         # After checkpoint load: self.step = restored step (e.g. 100), or 0 if fresh.
         loaded_step = self.step
+        profiler.set_memory_profiler_step(loaded_step)
 
         logger.info(f"Training starts at step {self.step + 1}")
 
-        with config.profiler.build(
+        with profiler.active(
             global_step=self.step,
             base_folder=config.dump_folder,
         ) as profiler:

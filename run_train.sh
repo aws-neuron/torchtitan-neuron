@@ -1,9 +1,10 @@
 #!/usr/bin/bash
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+#
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 set -ex
 
@@ -26,22 +27,37 @@ set -ex
 #    Example: NGPU=32 COMM_MODE="local_tensor" ./run_train.sh
 
 NGPU=${NGPU:-"8"}
+NNODES=${NNODES:-"1"}
+RDZV_ENDPOINT=${RDZV_ENDPOINT:-"localhost:0"}
 export LOG_RANK=${LOG_RANK:-0}
 MODULE=${MODULE:-"llama3"}
 CONFIG=${CONFIG:-"llama3_debugmodel"}
 COMM_MODE=${COMM_MODE:-""}
+
+# An optional first .sh argument can prepare the launch environment.
+# Example: ./run_train.sh path/to/environment.sh --training.steps 10
+if [[ "${1:-}" == *.sh ]]; then
+    ENVIRONMENT_SCRIPT=$1
+    if [[ ! -f "${ENVIRONMENT_SCRIPT}" ]]; then
+        echo "Environment script does not exist: ${ENVIRONMENT_SCRIPT}" >&2
+        exit 1
+    fi
+    source "${ENVIRONMENT_SCRIPT}"
+    shift
+fi
 
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 
 if [ -n "$COMM_MODE" ]; then
     # Communication mode specified: validate configuration or run in debug mode
     echo "Running with comm_mode=${COMM_MODE}"
-    NGPU="${NGPU}" LOCAL_RANK=0 python3 -m torchtitan.train --module ${MODULE} --config ${CONFIG} "$@" --comm.mode=${COMM_MODE} --training.steps 1
+    NGPU="${NGPU}" LOCAL_RANK=0 python3 -m torchtitan.train --module "${MODULE}" --config "${CONFIG}" "$@" --comm.mode="${COMM_MODE}" --training.steps 1
 else
     # Normal training with torchrun
     PYTORCH_ALLOC_CONF="expandable_segments:True" \
-    TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
-    torchrun --nproc_per_node=${NGPU} --rdzv_backend c10d --rdzv_endpoint="localhost:0" \
-    --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
-    -m torchtitan.train --module ${MODULE} --config ${CONFIG} "$@"
+    TORCHFT_LIGHTHOUSE="${TORCHFT_LIGHTHOUSE}" \
+    torchrun --nnodes="${NNODES}" --nproc_per_node="${NGPU}" \
+    --rdzv_backend c10d --rdzv_endpoint="${RDZV_ENDPOINT}" \
+    --local-ranks-filter "${LOG_RANK}" --role rank --tee 3 \
+    -m torchtitan.train --module "${MODULE}" --config "${CONFIG}" "$@"
 fi

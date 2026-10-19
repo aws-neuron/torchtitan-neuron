@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import fnmatch
 import time
@@ -43,32 +44,20 @@ def log_timer(label: str):
 def build_decoder_config_for_backend(
     config_builder: Callable, attn_backend: str, **builder_kwargs
 ):
-    """Build a Decoder model config for ``attn_backend``, allowing test-only SDPA.
+    """Build a Decoder model config for ``attn_backend``.
 
-    ``SDPA`` is not a valid production language-model backend — ``get_attention_config``
-    rejects it because the dataloaders always emit per-document positions and SDPA
-    cannot consume them (it only has a boolean ``is_causal``). The graph_trainer
-    tests, however, use SDPA to exercise *backend-agnostic* graph machinery
-    (precompile-artifact serialization, custom codegen, context parallel, bitwise
-    determinism) without FlexAttention's ``BlockMask``, which is unpicklable (its
-    ``mask_mod`` closures are Python code objects), is not a tensor (so it breaks
-    pipeline-parallel split-backward, which calls ``.requires_grad`` on every stage
-    input), and overflows the fp32 Triton shared-memory limit on large head dims.
-
-    For SDPA we build the flex config (a valid backend) and swap each layer's
-    ``inner_attention`` to ``ScaledDotProductAttention.Config()``. Production code
-    never reaches this path: ``get_attention_config`` still rejects ``sdpa``, so no
-    model registry can construct an SDPA language model outside these tests.
+    SDPA is a first-class backend (``get_attention_config`` constructs it
+    directly), so this is a plain passthrough. The graph_trainer config
+    presets select SDPA (the registries themselves default to flex) to
+    exercise *backend-agnostic* graph machinery (precompile-artifact
+    serialization, custom codegen, context parallel, bitwise determinism)
+    without FlexAttention's ``BlockMask``, which is unpicklable (its
+    ``mask_mod`` closures are Python code objects), is not a tensor (so it
+    breaks pipeline-parallel split-backward, which calls ``.requires_grad`` on
+    every stage input), and overflows the fp32 Triton shared-memory limit on
+    large head dims.
     """
-    if attn_backend != "sdpa":
-        return config_builder(attn_backend=attn_backend, **builder_kwargs)
-
-    from torchtitan.models.common.attention import ScaledDotProductAttention
-
-    config = config_builder(attn_backend="flex", **builder_kwargs)
-    for layer in config.layers:
-        layer.attention.inner_attention = ScaledDotProductAttention.Config()
-    return config
+    return config_builder(attn_backend=attn_backend, **builder_kwargs)
 
 
 def _local_stride(tensor: torch.Tensor) -> tuple[int, ...]:
@@ -412,15 +401,28 @@ def apply_simple_fsdp(
     *,
     parallel_dims: ParallelDims,
     training: TrainingConfig,
+    fsdp_first: bool = False,
 ) -> nn.Module:
     """Wrap the model (and any MoE experts) with graph_trainer's simple_fsdp.
 
     For MoE-enabled models, ``moe.experts`` submodules are separately wrapped
     on the EDP mesh when expert parallelism is enabled.
+
+    When ``fsdp_first`` is set, the HSDP DP mesh is requested with the ``fsdp``
+    axis outer (``["fsdp", "dp_replicate"]``) so SimpleFSDP's backward
+    reduce-scatters over ``fsdp`` before the ``dp_replicate`` all-reduce,
+    instead of all-reducing the full unsharded gradient first -- which for a
+    TP-sharded LM-head weight is a large fp32 buffer that overflows a 24 GiB
+    core. The default keeps the upstream replicate-first order.
+    Only the main model opts in; the MoE experts EDP mesh always uses the
+    default order (its placement is derived by axis name in ``data_parallel``,
+    so it is correct either way).
     """
     if parallel_dims.dp_replicate_enabled:
         if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
-            dp_mesh_dim_names = ["dp_replicate", "fsdp"]
+            dp_mesh_dim_names = (
+                ["fsdp", "dp_replicate"] if fsdp_first else ["dp_replicate", "fsdp"]
+            )
             dp_mode = "hybrid_shard"
         else:
             dp_mesh_dim_names = ["dp_replicate"]
@@ -445,6 +447,11 @@ def apply_simple_fsdp(
         assert edp_mesh is not None
 
         for _, transformer_block in model.layers.items():
+            # FullAC replaces each TransformerBlock with a checkpoint wrapper.
+            # Inspect the wrapped block so its MoE experts still receive EFSDP.
+            transformer_block = getattr(
+                transformer_block, "_checkpoint_wrapped_module", transformer_block
+            )
             if not isinstance(transformer_block, TransformerBlock):
                 continue
             moe = getattr(transformer_block, "moe", None)

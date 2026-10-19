@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import contextlib
 from collections.abc import Callable
@@ -45,9 +46,7 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig) -> None:
     # side-effects in backward, but torch.compile has no easy way to reapply
     # python mutations in the backward. Setting this flag accepts this eager
     # and compile divergence by skipping reapplication of side effects.
-    torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = (
-        True  # pyrefly: ignore [bad-assignment]
-    )
+    torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
 
     backend = _maybe_regional_inductor_backend(model, compile_config.backend)
 
@@ -64,26 +63,23 @@ def _maybe_regional_inductor_backend(model: nn.Module, backend: str) -> str | Ca
     ``regional_inductor`` lowers just the regions annotated with ``compile_with_inductor`` (see
     ``FlexAttention.forward``) to inductor while the rest stays in aot_eager.
 
-    Only applied for ``aot_eager`` on models that actually use FlexAttention, so
-    dense/non-flex aot_eager paths are left untouched. Other non-inductor backends
-    can't be scooped here and raise rather than silently degrading.
+    Only applied for ``aot_eager`` on models that actually use FlexAttention.
+    The ``inductor`` and ``neuron`` backends handle FlexAttention directly.
+    Other backends raise when the model uses FlexAttention.
     """
     from torchtitan.models.common.attention import FlexAttention
 
     uses_flex = any(isinstance(m, FlexAttention) for m in model.modules())
-    # Non-flex models never need the scoop; the default inductor backend already
-    # lowers the flex region directly. Both are left on the unmodified backend.
-    if not uses_flex or backend == "inductor":
+    # Non-flex models do not need regional compilation; inductor and neuron
+    # already handle the FlexAttention region directly.
+    if not uses_flex or backend in ("inductor", "neuron"):
         return backend
 
-    # FlexAttention only has an inductor lowering. Under a non-inductor backend
-    # other than aot_eager it would decompose to eager aten ops (no Triton
-    # kernel), which we can't transparently scoop here -- fail loudly.
     if backend != "aot_eager":
         raise ValueError(
-            f"Model uses FlexAttention but compile backend {backend!r} is neither "
-            f"'inductor' nor 'aot_eager'; the flex region would decompose to eager "
-            f"aten ops (no Triton kernel). Use 'inductor' or 'aot_eager'."
+            f"Model uses FlexAttention but compile backend {backend!r} is not "
+            "supported. Use 'inductor', 'neuron', or 'aot_eager' with regional "
+            "Inductor compilation."
         )
 
     from torch._dynamo.backends.common import aot_autograd
