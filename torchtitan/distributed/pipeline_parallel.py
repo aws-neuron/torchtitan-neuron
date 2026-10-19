@@ -78,7 +78,6 @@ def pipeline_llm(
     parallelism_context: ParallelismContext,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    local_compile_regions: list[str],
     activation_remat: ActivationRematConfig | None,
     dump_folder: str,
     device: torch.device,
@@ -144,7 +143,6 @@ def pipeline_llm(
             parallelism_context=parallelism_context,
             training=training,
             parallelism=parallelism,
-            local_compile_regions=local_compile_regions,
             activation_remat=activation_remat,
             dump_folder=dump_folder,
         )

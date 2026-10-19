@@ -20,7 +20,6 @@ import torch
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import ActivationRematConfig
-from torchtitan.distributed.local_compile import apply_local_compile
 from torchtitan.distributed.parallelism_context import ParallelismContext
 
 from .decoder import Decoder
@@ -37,12 +36,9 @@ class MultimodalModel(Decoder):
         parallelism_context: ParallelismContext,
         training: TrainingConfig,
         parallelism: ParallelismConfig,
-        local_compile_regions: list[str],
         activation_remat: ActivationRematConfig | None,
         dump_folder: str,
     ) -> Self:
-        # Bind local implementations early; torch.compile traces on first use.
-        apply_local_compile(local_compile_regions)
         with parallelism_context.activate_spmd():
             self._parallelize(parallelism_context)
             encoders = [

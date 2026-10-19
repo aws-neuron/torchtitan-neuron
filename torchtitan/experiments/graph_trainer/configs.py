@@ -340,8 +340,8 @@ def to_graph_trainer_config(
 
     Copies all fields from the base config and converts its model config to the
     GraphTrainer model config class, without local compile regions or in-place
-    WGRAD accumulation because GraphTrainer traces the whole step. The ``compile`` field keeps the
-    GraphTrainer.Config default; callers should explicitly set it.
+    WGRAD accumulation because GraphTrainer traces the whole step. The ``compile``
+    field keeps the GraphTrainer.Config default; callers should explicitly set it.
     """
     from .trainer import GraphTrainer
 
@@ -352,8 +352,8 @@ def to_graph_trainer_config(
             for f in fields(base_config.model)
         }
     )
-    # GraphTrainer compiles the whole step (config.compile), so it drops the model's local compile regions.
-    graph_model.local_compile_regions = []
+    # GraphTrainer compiles the whole step, so it drops the model's local regions.
+    graph_model.local_compile.regions = []
     disable_inplace_wgrad_accum(graph_model)
     d["model"] = graph_model
 

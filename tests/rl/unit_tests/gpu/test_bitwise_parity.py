@@ -137,12 +137,12 @@ def build_trainer_model(
         utils.set_default_dtype(TORCH_DTYPE_MAP[trainer_config.training.dtype]),
     ):
         model = model_config.build()
+    model_config.local_compile.apply()
 
     model = model.parallelize(
         parallelism_context=parallelism_context,
         training=trainer_config.training,
         parallelism=parallelism,
-        local_compile_regions=model_config.local_compile_regions,
         activation_remat=trainer_config.activation_remat,
         dump_folder=config.dump_folder,
     )

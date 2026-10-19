@@ -293,7 +293,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         create_seed_checkpoint: bool = False,
     ) -> None:
         """Initialize model execution and the state required to train it."""
-        self.model_config.local_compile.apply()
         self._initialize_model(
             hf_assets_path=hf_assets_path,
             create_seed_checkpoint=create_seed_checkpoint,
@@ -332,6 +331,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             utils.set_default_dtype(TORCH_DTYPE_MAP[self.config.training.dtype]),
         ):
             model = self.model_config.build()
+        # Model construction imports and registers model-specific local regions.
+        self.model_config.local_compile.apply()
         self.model_cls = type(model)
         adapter_cls = type(model).state_dict_adapter_cls
         self.state_dict_adapter = (
@@ -410,13 +411,11 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     def _parallelize_compile_kwargs(self) -> dict[str, Any]:
         """Return the compile kwargs ``model.parallelize``/``model.pipeline`` expect for this engine's models.
 
-        Regular models expect ``local_compile_regions`` (compiled regions); GraphTrainer overrides this to
-        return ``compile_config`` (whole-step compile).
+        Regular models need no compile kwargs because ``model.local_compile`` is
+        applied after model construction. GraphTrainer overrides this to return
+        ``compile_config`` (whole-step compile).
         """
-        # TODO: apply local compile outside parallelize/pipeline (#5026 review). That needs
-        # GraphTrainer to stop reading its compile config there first (apply_compile,
-        # EP-overlap chunking, enable_autoparallel, GraphPP runtime); then delete this hook.
-        return {"local_compile_regions": self.model_config.local_compile_regions}
+        return {}
 
     def _initialize_optim(self) -> None:
         """Construct the parameter update and its state."""

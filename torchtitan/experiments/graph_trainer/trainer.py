@@ -66,11 +66,11 @@ class GraphTrainingEngine(TrainingEngine):
     ) -> None:
         if config.optim.enable_cuda_graph:
             raise ValueError("Optim CUDA graphs are not supported with GraphTrainer.")
-        if model_config.local_compile_regions:
+        if model_config.local_compile.regions:
             raise ValueError(
                 "GraphTrainer traces the whole step into one graph; set "
-                "model.local_compile_regions = [] "
-                f"(got {model_config.local_compile_regions})."
+                "model.local_compile.regions = [] "
+                f"(got {model_config.local_compile.regions})."
             )
         if config.parallelism.fsdp_symm_mem_scope is not None:
             raise ValueError(
@@ -89,12 +89,9 @@ class GraphTrainingEngine(TrainingEngine):
     def _parallelize_compile_kwargs(self) -> dict[str, Any]:
         """Return the compile kwargs ``model.parallelize``/``model.pipeline`` expect for this engine's models.
 
-        Regular models expect ``local_compile_regions`` (compiled regions); GraphTrainer overrides this to
-        return ``compile_config`` (whole-step compile).
+        Regular models need no compile kwargs; GraphTrainer returns its
+        whole-step ``compile_config``.
         """
-        # TODO: apply local compile outside parallelize/pipeline (#5026 review). That needs
-        # GraphTrainer to stop reading its compile config there first (apply_compile,
-        # EP-overlap chunking, enable_autoparallel, GraphPP runtime); then delete this hook.
         return {"compile_config": self.config.compile}
 
     def _initialize_forward_backward(self) -> None:
@@ -359,7 +356,7 @@ class GraphTrainer(Trainer):
         compile: GraphTrainerCompileConfig = field(
             default_factory=GraphTrainerCompileConfig
         )
-        """Whole-step compile. GraphTrainer requires ``model.local_compile_regions`` to be empty."""
+        """Whole-step compile. GraphTrainer requires ``model.local_compile.regions`` to be empty."""
 
         def __post_init__(self) -> None:
             Trainer.Config.__post_init__(self)

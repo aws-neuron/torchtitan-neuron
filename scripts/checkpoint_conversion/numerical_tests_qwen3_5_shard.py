@@ -91,6 +91,7 @@ def run_worker(args):
 
     with parallelism_context.activate_spmd():
         model = config.build()
+    config.local_compile.apply()
     model.to_empty(device="cuda")
     model.init_weights(buffer_device=torch.device("cuda"))
 
@@ -98,7 +99,6 @@ def run_worker(args):
         parallelism_context=parallelism_context,
         training=training,
         parallelism=parallelism,
-        local_compile_regions=config.local_compile_regions,
         activation_remat=DefaultActivationRematConfig(),
         dump_folder="/tmp",
     )

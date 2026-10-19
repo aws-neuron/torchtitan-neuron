@@ -130,6 +130,7 @@ def _common_setup(config):
         utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]),
     ):
         model = model_config.build()
+    model_config.local_compile.apply()
 
     # For aot_fx_trace, apply_compile inside model.parallelize is a no-op
     # (returns model unchanged), so we pass the real compile_config.

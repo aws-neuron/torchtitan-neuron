@@ -747,16 +747,18 @@ def test_graph_training_engine_rejects_optimizer_cuda_graph() -> None:
     init.assert_not_called()
 
 
-def test_graph_training_engine_rejects_local_compile_regions() -> None:
+def test_graph_training_engine_rejects_local_compile() -> None:
     config = SimpleNamespace(optim=SimpleNamespace(enable_cuda_graph=False))
 
     with (
         patch.object(TrainingEngine, "__init__") as init,
-        pytest.raises(ValueError, match="local_compile_regions"),
+        pytest.raises(ValueError, match=r"local_compile\.regions"),
     ):
         GraphTrainingEngine(
             config,
-            model_config=SimpleNamespace(local_compile_regions=["loss"]),
+            model_config=SimpleNamespace(
+                local_compile=SimpleNamespace(regions=["loss"])
+            ),
             max_num_documents=None,
             output_dir="",
         )
@@ -764,14 +766,10 @@ def test_graph_training_engine_rejects_local_compile_regions() -> None:
     init.assert_not_called()
 
 
-def test_parallelize_compile_kwargs_include_regions_only() -> None:
-    engine = SimpleNamespace(
-        model_config=SimpleNamespace(local_compile_regions=["loss"])
-    )
+def test_parallelize_compile_kwargs_are_empty_for_regular_models() -> None:
+    engine = SimpleNamespace()
 
-    assert TrainingEngine._parallelize_compile_kwargs(engine) == {
-        "local_compile_regions": ["loss"],
-    }
+    assert TrainingEngine._parallelize_compile_kwargs(engine) == {}
 
 
 def test_optim_update_clips_before_parameter_update() -> None:
@@ -1106,11 +1104,6 @@ def test_seed_checkpoint_initialize_skips_forward_backward():
             ),
             _dist_moe_runtime=None,
             state_dict_adapter=None,
-            model_config=SimpleNamespace(
-                local_compile=SimpleNamespace(
-                    apply=lambda: events.append("local_compile")
-                )
-            ),
         ),
     )
     TrainingEngine.initialize(
@@ -1120,7 +1113,6 @@ def test_seed_checkpoint_initialize_skips_forward_backward():
     )
 
     assert events == [
-        "local_compile",
         "model",
         "model_memory",
         "optim",

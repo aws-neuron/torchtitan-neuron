@@ -8,7 +8,7 @@
 
 import functools
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -16,26 +16,19 @@ import torch
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 
 
-_COMPILED_HELPER_RESETS: list[Callable[[], None]] = []
-_LOCAL_COMPILE_CALLBACKS: dict[
-    str, list[Callable[["LocalCompileConfig", list[str]], None]]
-] = {}
-
-
-def _reset_compiled_helpers() -> None:
-    for reset in _COMPILED_HELPER_RESETS:
-        reset()
+_LOCAL_COMPILE_CALLBACKS: dict[str, list[Callable[["LocalCompileConfig"], None]]] = {}
+_LOCAL_COMPILE_GENERATION = 0
 
 
 @dataclass(kw_only=True, slots=True)
 class LocalCompileConfig:
-    """Policy for TorchTitan-owned local ``torch.compile`` boundaries."""
+    """Configuration for TorchTitan-owned local ``torch.compile`` boundaries."""
 
-    regions: list[str] | None = None
-    """Optional region override.
+    regions: list[str] = field(default_factory=list)
+    """Named ``@local_compile`` regions to compile independently."""
 
-    ``None`` preserves the model's existing ``local_compile_regions`` value.
-    """
+    backend: str = "inductor"
+    """Backend used by named regions, FlexAttention, and block-mask helpers."""
 
     def compile(
         self,
@@ -46,47 +39,39 @@ class LocalCompileConfig:
     ) -> Callable[..., Any]:
         """Compile one TorchTitan-owned region.
 
-        Subclasses can override this method to select an out-of-tree backend.
         ``inductor_options`` are forwarded only when the effective backend is
         Inductor.
         """
-        backend = compile_kwargs.setdefault("backend", "inductor")
+        backend = compile_kwargs.setdefault("backend", self.backend)
         if backend == "inductor" and inductor_options is not None:
             compile_kwargs.setdefault("options", inductor_options)
         return torch.compile(reference, **compile_kwargs)
 
-    def apply(self, fallback_regions: list[str] | None = None) -> None:
-        """Activate this policy and bind all registered named regions.
+    def apply(self) -> None:
+        """Activate this config and bind all registered named regions.
 
-        The active policy is process-wide. A later call replaces it for lazy
+        The active config is process-wide. A later call replaces it for lazy
         helpers such as FlexAttention and ``create_block_mask``.
         """
-        global _ACTIVE_LOCAL_COMPILE_CONFIG
+        global _ACTIVE_LOCAL_COMPILE_CONFIG, _LOCAL_COMPILE_GENERATION
 
-        regions = self.regions if self.regions is not None else fallback_regions
-        if regions is None:
-            regions = []
-
-        unknown = [name for name in regions if name not in _LOCAL_COMPILE_CALLBACKS]
+        unknown = [
+            name for name in self.regions if name not in _LOCAL_COMPILE_CALLBACKS
+        ]
         if unknown:
             raise ValueError(
-                f"Unknown local_compile_regions entries {unknown}; "
+                f"Unknown local_compile.regions entries {unknown}; "
                 f"registered values are {sorted(_LOCAL_COMPILE_CALLBACKS)}"
             )
 
         _ACTIVE_LOCAL_COMPILE_CONFIG = self
-        _reset_compiled_helpers()
+        _LOCAL_COMPILE_GENERATION += 1
         for callbacks in _LOCAL_COMPILE_CALLBACKS.values():
             for bind_local_compile_fn in callbacks:
-                bind_local_compile_fn(self, regions)
+                bind_local_compile_fn(self)
 
 
 _ACTIVE_LOCAL_COMPILE_CONFIG = LocalCompileConfig()
-
-
-def apply_local_compile(regions: list[str]) -> None:
-    """Bind regions using the active local compile policy."""
-    _ACTIVE_LOCAL_COMPILE_CONFIG.apply(regions)
 
 
 def local_compile(
@@ -98,8 +83,7 @@ def local_compile(
     """Register a function that can be compiled independently.
 
     Args:
-        name: Name used to enable the function in a model's
-            ``local_compile_regions`` or the policy's ``regions`` override.
+        name: Name used to enable the function in ``LocalCompileConfig.regions``.
         batch_invariant: Whether the compiled function preserves batch invariance.
         **compile_kwargs: Additional ``torch.compile`` keyword arguments;
             ``fullgraph`` is fixed to ``True`` so each function forms one complete
@@ -111,17 +95,14 @@ def local_compile(
     def decorate(reference: Callable[..., Any]) -> Callable[..., Any]:
         fn = reference
 
-        def bind_local_compile(
-            config: LocalCompileConfig,
-            regions: list[str],
-        ) -> None:
+        def bind_local_compile(config: LocalCompileConfig) -> None:
             nonlocal fn
-            enabled = name in regions
+            enabled = name in config.regions
             batch_invariant_mode = is_in_batch_invariant_mode()
             if enabled and batch_invariant_mode and not batch_invariant:
                 raise ValueError(
                     f"Local compile region {name!r} does not support "
-                    "batch-invariant mode; remove it from local_compile_regions."
+                    "batch-invariant mode; remove it from local_compile.regions."
                 )
             if enabled:
                 fn = config.compile(
@@ -154,28 +135,25 @@ def compiled(
     the effective backend is Inductor.
     """
     fn: Callable[..., Any] | None = None
-
-    def reset() -> None:
-        nonlocal fn
-        fn = None
+    applied_generation = -1
 
     @functools.wraps(reference)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        nonlocal fn
-        if fn is None:
+        nonlocal applied_generation, fn
+        if applied_generation != _LOCAL_COMPILE_GENERATION:
             fn = _ACTIVE_LOCAL_COMPILE_CONFIG.compile(
                 reference,
                 inductor_options=inductor_options,
                 **compile_kwargs,
             )
+            applied_generation = _LOCAL_COMPILE_GENERATION
+        assert fn is not None
         return fn(*args, **kwargs)
 
-    _COMPILED_HELPER_RESETS.append(reset)
     return wrapped
 
 
 __all__ = [
-    "apply_local_compile",
     "compiled",
     "LocalCompileConfig",
     "local_compile",
