@@ -50,7 +50,6 @@ package boundary, layout, included components, and recipe selection.
 | --- | --- |
 | Dense Qwen3 and Llama3 training | [Dense model tutorials](torchtitan_neuron/docs/dense-tutorials.md) |
 | Qwen3, DeepSeek-V3, and GPT-OSS MoE training | [MoE model tutorials](torchtitan_neuron/docs/moe-tutorials.md) |
-| MXFP8 training on Trainium3 | [Neuron MXFP8](torchtitan_neuron/docs/neuron_mxfp8.md) |
 | Qwen3 NKI mixture-of-experts recipes | [Qwen3 NKI MoE](torchtitan_neuron/docs/qwen3_nki_moe.md) |
 | Full Qwen3-235B-A22B training | [Four-node Trainium3 UltraServer guide](torchtitan_neuron/docs/qwen3_235b_full_ep128.md) |
 | Qwen3 inference with `torch.compile` | [Qwen3 inference](torchtitan_neuron/docs/qwen3_inference.md) |
