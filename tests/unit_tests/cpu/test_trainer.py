@@ -747,29 +747,21 @@ def test_graph_training_engine_rejects_optimizer_cuda_graph() -> None:
     init.assert_not_called()
 
 
-def test_graph_training_engine_rejects_local_compile() -> None:
+def test_graph_training_engine_rejects_local_compile_regions() -> None:
     config = SimpleNamespace(optim=SimpleNamespace(enable_cuda_graph=False))
 
     with (
         patch.object(TrainingEngine, "__init__") as init,
-        pytest.raises(ValueError, match=r"local_compile\.regions"),
+        pytest.raises(ValueError, match="local_compile_regions"),
     ):
         GraphTrainingEngine(
             config,
-            model_config=SimpleNamespace(
-                local_compile=SimpleNamespace(regions=["loss"])
-            ),
+            model_config=SimpleNamespace(local_compile_regions=["loss"]),
             max_num_documents=None,
             output_dir="",
         )
 
     init.assert_not_called()
-
-
-def test_parallelize_compile_kwargs_are_empty_for_regular_models() -> None:
-    engine = SimpleNamespace()
-
-    assert TrainingEngine._parallelize_compile_kwargs(engine) == {}
 
 
 def test_optim_update_clips_before_parameter_update() -> None:

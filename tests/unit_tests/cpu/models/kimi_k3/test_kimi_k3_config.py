@@ -21,7 +21,7 @@ def test_kimi_k3_enables_attention_residual_local_compile() -> None:
     config = kimi_k3_debugmodel()
     model_config = cast(KimiK3Model.Config, config.model)
 
-    assert model_config.local_compile.regions == [
+    assert model_config.local_compile_regions == [
         "loss",
         "gated_rmsnorm",
         "fused_binary_activation",

@@ -8,7 +8,7 @@
 
 import functools
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -24,11 +24,17 @@ _LOCAL_COMPILE_GENERATION = 0
 class LocalCompileConfig:
     """Configuration for TorchTitan-owned local ``torch.compile`` boundaries."""
 
-    regions: list[str] = field(default_factory=list)
-    """Named ``@local_compile`` regions to compile independently."""
-
+    regions: list[str]
     backend: str = "inductor"
-    """Backend used by named regions, FlexAttention, and block-mask helpers."""
+
+    def __bool__(self) -> bool:
+        return bool(self.regions)
+
+    def __contains__(self, region: str) -> bool:
+        return region in self.regions
+
+    def append(self, region: str) -> None:
+        self.regions.append(region)
 
     def compile(
         self,
@@ -37,22 +43,13 @@ class LocalCompileConfig:
         inductor_options: dict[str, Any] | None = None,
         **compile_kwargs: Any,
     ) -> Callable[..., Any]:
-        """Compile one TorchTitan-owned region.
-
-        ``inductor_options`` are forwarded only when the effective backend is
-        Inductor.
-        """
         backend = compile_kwargs.setdefault("backend", self.backend)
         if backend == "inductor" and inductor_options is not None:
             compile_kwargs.setdefault("options", inductor_options)
         return torch.compile(reference, **compile_kwargs)
 
     def apply(self) -> None:
-        """Activate this config and bind all registered named regions.
-
-        The active config is process-wide. A later call replaces it for lazy
-        helpers such as FlexAttention and ``create_block_mask``.
-        """
+        """Activate this config and bind all registered named regions."""
         global _ACTIVE_LOCAL_COMPILE_CONFIG, _LOCAL_COMPILE_GENERATION
 
         unknown = [
@@ -60,7 +57,7 @@ class LocalCompileConfig:
         ]
         if unknown:
             raise ValueError(
-                f"Unknown local_compile.regions entries {unknown}; "
+                f"Unknown local_compile_regions entries {unknown}; "
                 f"registered values are {sorted(_LOCAL_COMPILE_CALLBACKS)}"
             )
 
@@ -71,7 +68,21 @@ class LocalCompileConfig:
                 bind_local_compile_fn(self)
 
 
-_ACTIVE_LOCAL_COMPILE_CONFIG = LocalCompileConfig()
+_ACTIVE_LOCAL_COMPILE_CONFIG = LocalCompileConfig(regions=[])
+
+
+def _as_local_compile_config(
+    value: list[str] | LocalCompileConfig,
+) -> LocalCompileConfig:
+    """Normalize the existing region-list setting to one local compile config."""
+    if isinstance(value, LocalCompileConfig):
+        return value
+    return LocalCompileConfig(regions=value)
+
+
+def apply_local_compile(value: list[str] | LocalCompileConfig) -> None:
+    """Bind local compile boundaries from a region list or full config."""
+    _as_local_compile_config(value).apply()
 
 
 def local_compile(
@@ -83,7 +94,7 @@ def local_compile(
     """Register a function that can be compiled independently.
 
     Args:
-        name: Name used to enable the function in ``LocalCompileConfig.regions``.
+        name: Name used to enable the function in a model's ``local_compile_regions``.
         batch_invariant: Whether the compiled function preserves batch invariance.
         **compile_kwargs: Additional ``torch.compile`` keyword arguments;
             ``fullgraph`` is fixed to ``True`` so each function forms one complete
@@ -102,14 +113,10 @@ def local_compile(
             if enabled and batch_invariant_mode and not batch_invariant:
                 raise ValueError(
                     f"Local compile region {name!r} does not support "
-                    "batch-invariant mode; remove it from local_compile.regions."
+                    "batch-invariant mode; remove it from local_compile_regions."
                 )
             if enabled:
-                fn = config.compile(
-                    reference,
-                    fullgraph=True,
-                    **compile_kwargs,
-                )
+                fn = config.compile(reference, fullgraph=True, **compile_kwargs)
             else:
                 fn = reference
 
@@ -129,11 +136,7 @@ def compiled(
     inductor_options: dict[str, Any] | None = None,
     **compile_kwargs: Any,
 ) -> Callable[..., Any]:
-    """Compile ``reference`` lazily with the configured local backend.
-
-    ``inductor_options`` are passed as ``torch.compile(options=...)`` only when
-    the effective backend is Inductor.
-    """
+    """Compile lazily with the active local compile backend."""
     fn: Callable[..., Any] | None = None
     applied_generation = -1
 
@@ -154,7 +157,8 @@ def compiled(
 
 
 __all__ = [
+    "apply_local_compile",
     "compiled",
-    "LocalCompileConfig",
     "local_compile",
+    "LocalCompileConfig",
 ]

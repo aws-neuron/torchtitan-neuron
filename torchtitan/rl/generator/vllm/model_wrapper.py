@@ -32,7 +32,7 @@ from vllm.logger import init_logger
 from vllm.utils import torch_utils as _torch_utils
 
 # Registers the "loss" local-compile region. The generator shares the trainer's
-# model config, whose local_compile.regions may name it, but never builds a loss.
+# model config, whose local_compile_regions may name it, but never builds a loss.
 from torchtitan.components import loss as _loss  # noqa: F401
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import TrainingConfig
@@ -359,7 +359,6 @@ class VLLMModelWrapper(Module):
         # Build model on meta device to avoid allocating full model on every GPU
         with self.parallelism_context.activate_spmd(), torch.device("meta"):
             self.model = self.config.build()
-        self.config.local_compile.apply()
         self.model._skip_lm_head = True
         if getattr(self.model, "vision_encoder", None) is not None:
             self.model.vision_encoder = None
@@ -368,6 +367,7 @@ class VLLMModelWrapper(Module):
             parallelism_context=self.parallelism_context,
             training=TrainingConfig(),
             parallelism=training_parallelism,
+            local_compile_regions=self.config.local_compile_regions,
             activation_remat=None,
             dump_folder="",
         )

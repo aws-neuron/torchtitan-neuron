@@ -167,7 +167,6 @@ def set_determinism(
             # no options) so the regional-inductor scoop configs are preserved.
             FlexInnerAttention.inductor_configs["max_autotune"] = False
             FlexInnerAttention.inductor_configs["coordinate_descent_tuning"] = False
-
     if debug_config.detect_anomaly:
         logger.warning(
             "Anomaly detection enabled. This incurs significant overhead "

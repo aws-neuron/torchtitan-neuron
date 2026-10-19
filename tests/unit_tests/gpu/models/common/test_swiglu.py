@@ -9,17 +9,17 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from torchtitan.distributed.local_compile import LocalCompileConfig
+from torchtitan.distributed.local_compile import apply_local_compile
 from torchtitan.models.common.activation import ClampedSwiGLU, SiTUGLU, SwiGLU
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestSwiGLULocalCompile(unittest.TestCase):
     def setUp(self):
-        LocalCompileConfig(regions=["fused_binary_activation"]).apply()
+        apply_local_compile(["fused_binary_activation"])
 
     def tearDown(self):
-        LocalCompileConfig().apply()
+        apply_local_compile([])
         torch._dynamo.reset()
 
     def test_forward_and_backward_emit_triton(self):

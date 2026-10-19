@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch_remat as remat
 
-from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.common.attention import (
     FlexAttentionMetadata,
     VarlenAttentionMetadata,
@@ -109,15 +108,13 @@ class Qwen3Model(Decoder):
     class Config(Decoder.Config):
         dim: int = 1024
         vocab_size: int = 151936
-        local_compile: LocalCompileConfig = field(
-            default_factory=lambda: LocalCompileConfig(
-                regions=[
-                    "loss",
-                    "fused_binary_activation",
-                    "cos_sin_rope",
-                    "fp32_to_bf16_split",
-                ]
-            )
+        local_compile_regions: list[str] = field(
+            default_factory=lambda: [
+                "loss",
+                "fused_binary_activation",
+                "cos_sin_rope",
+                "fp32_to_bf16_split",
+            ]
         )
 
         def get_nparams_and_flops(

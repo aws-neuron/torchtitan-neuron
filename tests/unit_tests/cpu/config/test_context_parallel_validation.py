@@ -198,6 +198,7 @@ class TestGptOssUlysses(unittest.TestCase):
                 parallelism_context=SimpleNamespace(cp_enabled=True),
                 training=None,
                 parallelism=None,
+                local_compile_regions=[],
                 activation_remat=None,
                 dump_folder="",
             )

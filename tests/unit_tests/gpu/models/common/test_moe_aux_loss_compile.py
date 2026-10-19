@@ -8,14 +8,14 @@ import unittest
 
 import torch
 
-from torchtitan.distributed.local_compile import LocalCompileConfig
+from torchtitan.distributed.local_compile import apply_local_compile
 from torchtitan.models.common.moe import _microbatch_load_balance_local_stats
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestMoEAuxLossLocalCompile(unittest.TestCase):
     def tearDown(self):
-        LocalCompileConfig().apply()
+        apply_local_compile([])
         torch._dynamo.reset()
 
     def test_forward_and_backward_match_eager(self):
@@ -43,7 +43,7 @@ class TestMoEAuxLossLocalCompile(unittest.TestCase):
             generator=generator,
         )
 
-        LocalCompileConfig().apply()
+        apply_local_compile([])
         eager_counts_E, eager_prob_sums_E = _microbatch_load_balance_local_stats(
             scores_TE,
             routing_map_TE,
@@ -53,7 +53,7 @@ class TestMoEAuxLossLocalCompile(unittest.TestCase):
             eager_prob_sums_E, scores_TE, grad_prob_sums_E
         )[0]
 
-        LocalCompileConfig(regions=["moe_aux_loss"]).apply()
+        apply_local_compile(["moe_aux_loss"])
         compiled_counts_E, compiled_prob_sums_E = _microbatch_load_balance_local_stats(
             scores_TE,
             routing_map_TE,

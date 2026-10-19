@@ -8,7 +8,7 @@ import unittest
 
 import torch
 
-from torchtitan.distributed.local_compile import LocalCompileConfig
+from torchtitan.distributed.local_compile import apply_local_compile
 from torchtitan.models.common import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.kimi_k3.model import AttentionResidual
@@ -45,11 +45,11 @@ def _reference(
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestKimiK3AttentionResidualLocalCompile(unittest.TestCase):
     def setUp(self):
-        LocalCompileConfig(regions=["attention_residual"]).apply()
+        apply_local_compile(["attention_residual"])
         self.attention_residual = AttentionResidual.Config().build()
 
     def tearDown(self):
-        LocalCompileConfig().apply()
+        apply_local_compile([])
         torch._dynamo.reset()
 
     def test_forward_and_backward_emit_triton(self):

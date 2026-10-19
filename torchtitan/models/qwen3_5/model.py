@@ -18,7 +18,7 @@ from torch import nn
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import ActivationRematConfig
-from torchtitan.distributed.local_compile import local_compile, LocalCompileConfig
+from torchtitan.distributed.local_compile import local_compile
 from torchtitan.distributed.parallelism_context import MeshAxisName, ParallelismContext
 from torchtitan.distributed.spmd_types import (
     annotate_input_spmd_types,
@@ -353,18 +353,16 @@ class Qwen35Model(MultimodalModel):
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         vision_encoder: Qwen35VisionEncoder.Config | None = None
-        local_compile: LocalCompileConfig = field(
-            default_factory=lambda: LocalCompileConfig(
-                regions=[
-                    "loss",
-                    "fused_binary_activation",
-                    "gated_rmsnorm",
-                    "offset_rmsnorm",
-                    "partial_rope",
-                    "shared_expert_gate",
-                    "fp32_to_bf16_split",
-                ]
-            )
+        local_compile_regions: list[str] = field(
+            default_factory=lambda: [
+                "loss",
+                "fused_binary_activation",
+                "gated_rmsnorm",
+                "offset_rmsnorm",
+                "partial_rope",
+                "shared_expert_gate",
+                "fp32_to_bf16_split",
+            ]
         )
 
         def get_nparams_and_flops(
@@ -438,6 +436,7 @@ class Qwen35Model(MultimodalModel):
         parallelism_context: ParallelismContext,
         training: TrainingConfig,
         parallelism: ParallelismConfig,
+        local_compile_regions: list[str],
         activation_remat: ActivationRematConfig | None,
         dump_folder: str,
     ) -> Qwen35Model:
@@ -445,6 +444,7 @@ class Qwen35Model(MultimodalModel):
             parallelism_context=parallelism_context,
             training=training,
             parallelism=parallelism,
+            local_compile_regions=local_compile_regions,
             activation_remat=activation_remat,
             dump_folder=dump_folder,
         )
