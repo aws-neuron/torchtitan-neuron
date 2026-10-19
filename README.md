@@ -61,6 +61,9 @@ Report problems with running on Neuron or Trainium in this repository's [issues]
 
 ## Package layout
 
+The Neuron-specific recipes, NKI kernel integrations, and docs are in
+[`torchtitan_neuron/`](torchtitan_neuron/README.md):
+
 ```text
 torchtitan_neuron/
 |-- models/       Neuron modules and Trainer configuration registries
