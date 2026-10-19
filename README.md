@@ -71,18 +71,6 @@ torchtitan_neuron/
 `-- tests/        Neuron kernel, Trainer, and GraphTrainer tests
 ```
 
-## Testing
-
-Run the Neuron extension test suite from the repository root:
-
-```bash
-pytest -s torchtitan_neuron/tests/
-```
-
-Hardware-specific tests require AWS Trainium and the corresponding AWS Neuron
-dependencies. Tests that do not require Neuron hardware skip when those
-dependencies are unavailable.
-
 ## License
 
 This project is licensed under the [BSD 3-Clause License](LICENSE).
