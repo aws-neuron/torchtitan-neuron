@@ -21,6 +21,7 @@ Before you start, install and verify `torch-neuronx` on a Trn2 or Trn3 instance 
 ```bash
 git clone https://github.com/aws-neuron/torchtitan-neuron.git
 cd torchtitan-neuron
+git checkout release_2.33.0
 pip install -r requirements.txt
 pip install -e .
 ```
