@@ -79,7 +79,7 @@ class TestFlexCrossDocumentLeakage(unittest.TestCase):
 
 
 class TestHFTransformerConfig(unittest.TestCase):
-    def test_local_compile_backend_defaults_to_inductor(self):
+    def test_local_compile_defaults_to_inductor_policy(self):
         from torchtitan.experiments.transformers_modeling_backend import (
             TitanModelConfig,
         )
@@ -96,7 +96,11 @@ class TestHFTransformerConfig(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(config.local_compile_backend, "inductor")
+        self.assertEqual(
+            config.local_compile_regions,
+            ["loss", "fused_binary_activation"],
+        )
+        self.assertIsNone(config.local_compile.regions)
 
 
 class TestAttnMaskTypeValidation(unittest.TestCase):

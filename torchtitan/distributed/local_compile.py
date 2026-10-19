@@ -4,10 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Function-scoped torch.compile registration."""
+"""Function-scoped torch.compile registration and configuration."""
 
 import functools
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -15,8 +16,10 @@ import torch
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 
 
-_BACKEND: str = "inductor"
 _COMPILED_HELPER_RESETS: list[Callable[[], None]] = []
+_LOCAL_COMPILE_CALLBACKS: dict[
+    str, list[Callable[["LocalCompileConfig", list[str]], None]]
+] = {}
 
 
 def _reset_compiled_helpers() -> None:
@@ -24,31 +27,66 @@ def _reset_compiled_helpers() -> None:
         reset()
 
 
-def set_local_compile_backend(backend: str) -> None:
-    """Set the process-wide backend used by local compile helpers."""
-    global _BACKEND
-    _BACKEND = backend
-    _reset_compiled_helpers()
+@dataclass(kw_only=True, slots=True)
+class LocalCompileConfig:
+    """Policy for TorchTitan-owned local ``torch.compile`` boundaries."""
+
+    regions: list[str] | None = None
+    """Optional region override.
+
+    ``None`` preserves the model's existing ``local_compile_regions`` value.
+    """
+
+    def compile(
+        self,
+        reference: Callable[..., Any],
+        *,
+        inductor_options: dict[str, Any] | None = None,
+        **compile_kwargs: Any,
+    ) -> Callable[..., Any]:
+        """Compile one TorchTitan-owned region.
+
+        Subclasses can override this method to select an out-of-tree backend.
+        ``inductor_options`` are forwarded only when the effective backend is
+        Inductor.
+        """
+        backend = compile_kwargs.setdefault("backend", "inductor")
+        if backend == "inductor" and inductor_options is not None:
+            compile_kwargs.setdefault("options", inductor_options)
+        return torch.compile(reference, **compile_kwargs)
+
+    def apply(self, fallback_regions: list[str] | None = None) -> None:
+        """Activate this policy and bind all registered named regions.
+
+        The active policy is process-wide. A later call replaces it for lazy
+        helpers such as FlexAttention and ``create_block_mask``.
+        """
+        global _ACTIVE_LOCAL_COMPILE_CONFIG
+
+        regions = self.regions if self.regions is not None else fallback_regions
+        if regions is None:
+            regions = []
+
+        unknown = [name for name in regions if name not in _LOCAL_COMPILE_CALLBACKS]
+        if unknown:
+            raise ValueError(
+                f"Unknown local_compile_regions entries {unknown}; "
+                f"registered values are {sorted(_LOCAL_COMPILE_CALLBACKS)}"
+            )
+
+        _ACTIVE_LOCAL_COMPILE_CONFIG = self
+        _reset_compiled_helpers()
+        for callbacks in _LOCAL_COMPILE_CALLBACKS.values():
+            for bind_local_compile_fn in callbacks:
+                bind_local_compile_fn(self, regions)
+
+
+_ACTIVE_LOCAL_COMPILE_CONFIG = LocalCompileConfig()
 
 
 def apply_local_compile(regions: list[str]) -> None:
-    """Bind registered functions to eager or compiled implementations.
-
-    Process-wide: a later call replaces this choice for every model in the process.
-    """
-    unknown = [name for name in regions if name not in _LOCAL_COMPILE_CALLBACKS]
-    if unknown:
-        raise ValueError(
-            f"Unknown local_compile_regions entries {unknown}; "
-            f"registered values are {sorted(_LOCAL_COMPILE_CALLBACKS)}"
-        )
-
-    for callbacks in _LOCAL_COMPILE_CALLBACKS.values():
-        for bind_local_compile_fn in callbacks:
-            bind_local_compile_fn(regions)
-
-
-_LOCAL_COMPILE_CALLBACKS: dict[str, list[Callable[[list[str]], None]]] = {}
+    """Bind regions using the active local compile policy."""
+    _ACTIVE_LOCAL_COMPILE_CONFIG.apply(regions)
 
 
 def local_compile(
@@ -60,7 +98,8 @@ def local_compile(
     """Register a function that can be compiled independently.
 
     Args:
-        name: Name used to enable the function in a model's ``local_compile_regions``.
+        name: Name used to enable the function in a model's
+            ``local_compile_regions`` or the policy's ``regions`` override.
         batch_invariant: Whether the compiled function preserves batch invariance.
         **compile_kwargs: Additional ``torch.compile`` keyword arguments;
             ``fullgraph`` is fixed to ``True`` so each function forms one complete
@@ -68,12 +107,14 @@ def local_compile(
     """
     if compile_kwargs.pop("fullgraph", True) is not True:
         raise ValueError("local_compile requires fullgraph=True.")
-    explicit_backend = compile_kwargs.pop("backend", None)
 
     def decorate(reference: Callable[..., Any]) -> Callable[..., Any]:
         fn = reference
 
-        def bind_local_compile(regions: list[str]) -> None:
+        def bind_local_compile(
+            config: LocalCompileConfig,
+            regions: list[str],
+        ) -> None:
             nonlocal fn
             enabled = name in regions
             batch_invariant_mode = is_in_batch_invariant_mode()
@@ -83,11 +124,9 @@ def local_compile(
                     "batch-invariant mode; remove it from local_compile_regions."
                 )
             if enabled:
-                backend = _BACKEND if explicit_backend is None else explicit_backend
-                fn = torch.compile(
+                fn = config.compile(
                     reference,
                     fullgraph=True,
-                    backend=backend,
                     **compile_kwargs,
                 )
             else:
@@ -114,8 +153,6 @@ def compiled(
     ``inductor_options`` are passed as ``torch.compile(options=...)`` only when
     the effective backend is Inductor.
     """
-    explicit_backend = compile_kwargs.pop("backend", None)
-    explicit_options = compile_kwargs.pop("options", None)
     fn: Callable[..., Any] | None = None
 
     def reset() -> None:
@@ -126,23 +163,11 @@ def compiled(
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         nonlocal fn
         if fn is None:
-            backend = _BACKEND if explicit_backend is None else explicit_backend
-            options = explicit_options
-            if backend == "inductor" and inductor_options is not None:
-                options = inductor_options
-            if options is None:
-                fn = torch.compile(
-                    reference,
-                    backend=backend,
-                    **compile_kwargs,
-                )
-            else:
-                fn = torch.compile(
-                    reference,
-                    backend=backend,
-                    options=options,
-                    **compile_kwargs,
-                )
+            fn = _ACTIVE_LOCAL_COMPILE_CONFIG.compile(
+                reference,
+                inductor_options=inductor_options,
+                **compile_kwargs,
+            )
         return fn(*args, **kwargs)
 
     _COMPILED_HELPER_RESETS.append(reset)
@@ -152,6 +177,6 @@ def compiled(
 __all__ = [
     "apply_local_compile",
     "compiled",
+    "LocalCompileConfig",
     "local_compile",
-    "set_local_compile_backend",
 ]

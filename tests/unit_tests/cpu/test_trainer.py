@@ -1106,27 +1106,26 @@ def test_seed_checkpoint_initialize_skips_forward_backward():
             ),
             _dist_moe_runtime=None,
             state_dict_adapter=None,
-            model_config=SimpleNamespace(local_compile_backend="custom_device_backend"),
+            model_config=SimpleNamespace(
+                local_compile=SimpleNamespace(
+                    apply=lambda: events.append("local_compile")
+                )
+            ),
         ),
     )
-    with patch(
-        "torchtitan.training_engine.set_local_compile_backend",
-        side_effect=lambda backend: events.append(("backend", backend)),
-    ) as set_backend:
-        TrainingEngine.initialize(
-            engine,
-            hf_assets_path="",
-            create_seed_checkpoint=True,
-        )
+    TrainingEngine.initialize(
+        engine,
+        hf_assets_path="",
+        create_seed_checkpoint=True,
+    )
 
     assert events == [
-        ("backend", "custom_device_backend"),
+        "local_compile",
         "model",
         "model_memory",
         "optim",
         "checkpointer",
     ]
-    set_backend.assert_called_once_with("custom_device_backend")
     assert engine.model_device_mem_stats is model_mem_stats
     engine._initialize_model.assert_called_once_with(
         hf_assets_path="",

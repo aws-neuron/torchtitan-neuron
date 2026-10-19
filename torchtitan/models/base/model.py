@@ -14,7 +14,7 @@ import torch
 
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.local_compile import apply_local_compile
+from torchtitan.distributed.local_compile import apply_local_compile, LocalCompileConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
 
 from .module import Module
@@ -92,8 +92,12 @@ class BaseModel(Module, ABC):
         FlexAttention manages its own compilation and is not controlled by this list.
         """
 
-        local_compile_backend: str = "inductor"
-        """Backend for TorchTitan-owned local and attention compile sites."""
+        local_compile: LocalCompileConfig = field(default_factory=LocalCompileConfig)
+        """Policy for TorchTitan-owned local and attention compile sites.
+
+        Out-of-tree device backends can supply a subclass that overrides
+        ``compile``.
+        """
 
         @abstractmethod
         def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:

@@ -4,6 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
@@ -13,7 +16,7 @@ from torchtitan.distributed.local_compile import (
     apply_local_compile,
     compiled,
     local_compile,
-    set_local_compile_backend,
+    LocalCompileConfig,
 )
 from torchtitan.models.common.attention import FlexInnerAttention
 from torchtitan.models.common.attention.attention import _compiled_create_block_mask
@@ -21,13 +24,29 @@ from torchtitan.models.common.moe import _microbatch_load_balance_local_stats
 from torchtitan.models.common.vision_encoder import compiled_create_block_mask
 
 
+class CustomDeviceLocalCompileConfig(LocalCompileConfig):
+    """Example policy supplied by an out-of-tree device backend."""
+
+    def compile(
+        self,
+        reference: Callable[..., Any],
+        *,
+        inductor_options: dict[str, Any] | None = None,
+        **compile_kwargs: Any,
+    ) -> Callable[..., Any]:
+        compile_kwargs.setdefault("backend", "custom_device_backend")
+        return super().compile(
+            reference,
+            inductor_options=inductor_options,
+            **compile_kwargs,
+        )
+
+
 @pytest.fixture(autouse=True)
 def reset_local_compile():
-    set_local_compile_backend("inductor")
-    apply_local_compile([])
+    LocalCompileConfig().apply()
     yield
-    set_local_compile_backend("inductor")
-    apply_local_compile([])
+    LocalCompileConfig().apply()
 
 
 def test_apply_local_compile_rejects_unknown_name() -> None:
@@ -52,11 +71,12 @@ def test_local_compile_rebinds_active_region_when_backend_changes(monkeypatch) -
         return compiled
 
     monkeypatch.setattr(torch, "compile", fake_compile)
+    LocalCompileConfig().apply()
     apply_local_compile(["test_local_compile"])
 
     assert fn(3) == ("inductor", 3)
 
-    set_local_compile_backend("custom_device_backend")
+    CustomDeviceLocalCompileConfig().apply()
     apply_local_compile(["test_local_compile"])
 
     assert fn(3) == ("custom_device_backend", 3)
@@ -170,11 +190,11 @@ def test_compiled_helper_only_forwards_options_to_inductor(monkeypatch) -> None:
 
     monkeypatch.setattr(torch, "compile", fake_compile)
     helper = compiled(reference, inductor_options=options)
-    set_local_compile_backend("custom_device_backend")
+    CustomDeviceLocalCompileConfig().apply()
 
     assert compiled_calls == []
     assert helper(3) == 3
-    set_local_compile_backend("inductor")
+    LocalCompileConfig().apply()
     assert helper(3) == 3
     assert compiled_calls == [
         (
@@ -205,7 +225,7 @@ def test_attention_helpers_do_not_forward_inductor_options_to_custom_backend(
         return lambda *args, **kwargs: None
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    set_local_compile_backend("custom_device_backend")
+    CustomDeviceLocalCompileConfig().apply()
 
     FlexInnerAttention._compiled_flex_attn()
     _compiled_create_block_mask()
