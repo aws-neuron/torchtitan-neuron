@@ -17,7 +17,7 @@ from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 
 
 _LOCAL_COMPILE_CALLBACKS: dict[str, list[Callable[["LocalCompileConfig"], None]]] = {}
-_LOCAL_COMPILE_GENERATION = 0
+_ALWAYS_COMPILE_CALLBACKS: list[Callable[["LocalCompileConfig"], None]] = []
 
 
 @dataclass(kw_only=True, slots=True)
@@ -25,33 +25,24 @@ class LocalCompileConfig:
     """Configuration for TorchTitan-owned local ``torch.compile`` boundaries."""
 
     regions: list[str] = field(default_factory=list)
-    backend: str = "inductor"
 
-    def __bool__(self) -> bool:
-        return bool(self.regions)
-
-    def __contains__(self, region: str) -> bool:
-        return region in self.regions
-
-    def append(self, region: str) -> None:
-        self.regions.append(region)
-
-    def compile(
+    def _compile(
         self,
         reference: Callable[..., Any],
         *,
         inductor_options: dict[str, Any] | None = None,
         **compile_kwargs: Any,
     ) -> Callable[..., Any]:
-        backend = compile_kwargs.setdefault("backend", self.backend)
-        if backend == "inductor" and inductor_options is not None:
+        """Compile one boundary with Inductor.
+
+        Out-of-tree subclasses can override this hook to select another backend.
+        """
+        if inductor_options is not None:
             compile_kwargs.setdefault("options", inductor_options)
         return torch.compile(reference, **compile_kwargs)
 
     def apply(self) -> None:
-        """Activate this config and bind all registered named regions."""
-        global _ACTIVE_LOCAL_COMPILE_CONFIG, _LOCAL_COMPILE_GENERATION
-
+        """Bind named regions and always-compiled helpers using this config."""
         unknown = [
             name for name in self.regions if name not in _LOCAL_COMPILE_CALLBACKS
         ]
@@ -61,28 +52,11 @@ class LocalCompileConfig:
                 f"registered values are {sorted(_LOCAL_COMPILE_CALLBACKS)}"
             )
 
-        _ACTIVE_LOCAL_COMPILE_CONFIG = self
-        _LOCAL_COMPILE_GENERATION += 1
         for callbacks in _LOCAL_COMPILE_CALLBACKS.values():
             for bind_local_compile_fn in callbacks:
                 bind_local_compile_fn(self)
-
-
-_ACTIVE_LOCAL_COMPILE_CONFIG = LocalCompileConfig()
-
-
-def _as_local_compile_config(
-    value: list[str] | LocalCompileConfig,
-) -> LocalCompileConfig:
-    """Normalize the existing region-list setting to one local compile config."""
-    if isinstance(value, LocalCompileConfig):
-        return value
-    return LocalCompileConfig(regions=value)
-
-
-def apply_local_compile(value: list[str] | LocalCompileConfig) -> None:
-    """Bind local compile boundaries from a region list or full config."""
-    _as_local_compile_config(value).apply()
+        for bind_compile_fn in _ALWAYS_COMPILE_CALLBACKS:
+            bind_compile_fn(self)
 
 
 def local_compile(
@@ -116,7 +90,7 @@ def local_compile(
                     "batch-invariant mode; remove it from local_compile_regions."
                 )
             if enabled:
-                fn = config.compile(reference, fullgraph=True, **compile_kwargs)
+                fn = config._compile(reference, fullgraph=True, **compile_kwargs)
             else:
                 fn = reference
 
@@ -136,28 +110,30 @@ def compiled(
     inductor_options: dict[str, Any] | None = None,
     **compile_kwargs: Any,
 ) -> Callable[..., Any]:
-    """Compile lazily with the active local compile backend."""
-    fn: Callable[..., Any] | None = None
-    applied_generation = -1
+    """Create an always-compiled helper controlled by ``LocalCompileConfig``."""
+    fn = LocalCompileConfig()._compile(
+        reference,
+        inductor_options=inductor_options,
+        **compile_kwargs,
+    )
+
+    def bind_compile(config: LocalCompileConfig) -> None:
+        nonlocal fn
+        fn = config._compile(
+            reference,
+            inductor_options=inductor_options,
+            **compile_kwargs,
+        )
 
     @functools.wraps(reference)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        nonlocal applied_generation, fn
-        if applied_generation != _LOCAL_COMPILE_GENERATION:
-            fn = _ACTIVE_LOCAL_COMPILE_CONFIG.compile(
-                reference,
-                inductor_options=inductor_options,
-                **compile_kwargs,
-            )
-            applied_generation = _LOCAL_COMPILE_GENERATION
-        assert fn is not None
         return fn(*args, **kwargs)
 
+    _ALWAYS_COMPILE_CALLBACKS.append(bind_compile)
     return wrapped
 
 
 __all__ = [
-    "apply_local_compile",
     "compiled",
     "local_compile",
     "LocalCompileConfig",

@@ -20,6 +20,7 @@ from torch import nn
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import ActivationRematConfig
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.distributed.spmd_types import (
     annotate_input_spmd_types,
@@ -117,7 +118,7 @@ class KimiK25Model(MultimodalModel, MTPDecoder):
         parallelism_context: ParallelismContext,
         training: TrainingConfig,
         parallelism: ParallelismConfig,
-        local_compile_regions: list[str],
+        local_compile_regions: LocalCompileConfig,
         activation_remat: ActivationRematConfig | None,
         dump_folder: str,
     ) -> KimiK25Model:

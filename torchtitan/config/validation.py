@@ -137,11 +137,12 @@ def validate_model_training_config(
                     f"dispatcher: {type(dispatcher_config).__qualname__}."
                 )
 
-    if debug.spmd_typechecking and model.local_compile_regions:
+    if debug.spmd_typechecking and model.local_compile_regions.regions:
         # TODO: Remove this once Dynamo supports tracing SPMD typechecking.
         raise ValueError(
             "Local compilation is not supported with SPMD typechecking. "
-            "Set model.local_compile_regions=[] or disable debug.spmd_typechecking."
+            "Set model.local_compile_regions.regions=[] or disable "
+            "debug.spmd_typechecking."
         )
 
     validate_context_parallel(model, parallelism)

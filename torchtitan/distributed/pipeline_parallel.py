@@ -32,6 +32,7 @@ from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.activation_remat import ActivationRematConfig
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.base.model import BaseModel
 from torchtitan.models.base.module import ModuleDict, ModuleList
 from torchtitan.models.common.decoder import Decoder
@@ -78,7 +79,7 @@ def pipeline_llm(
     parallelism_context: ParallelismContext,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    local_compile_regions: list[str],
+    local_compile_regions: LocalCompileConfig,
     activation_remat: ActivationRematConfig | None,
     dump_folder: str,
     device: torch.device,

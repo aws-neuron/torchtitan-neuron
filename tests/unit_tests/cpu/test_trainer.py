@@ -756,7 +756,9 @@ def test_graph_training_engine_rejects_local_compile_regions() -> None:
     ):
         GraphTrainingEngine(
             config,
-            model_config=SimpleNamespace(local_compile_regions=["loss"]),
+            model_config=SimpleNamespace(
+                local_compile_regions=SimpleNamespace(regions=["loss"])
+            ),
             max_num_documents=None,
             output_dir="",
         )
