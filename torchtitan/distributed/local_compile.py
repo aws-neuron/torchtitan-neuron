@@ -8,7 +8,7 @@
 
 import functools
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -24,7 +24,7 @@ _LOCAL_COMPILE_GENERATION = 0
 class LocalCompileConfig:
     """Configuration for TorchTitan-owned local ``torch.compile`` boundaries."""
 
-    regions: list[str]
+    regions: list[str] = field(default_factory=list)
     backend: str = "inductor"
 
     def __bool__(self) -> bool:
@@ -68,7 +68,7 @@ class LocalCompileConfig:
                 bind_local_compile_fn(self)
 
 
-_ACTIVE_LOCAL_COMPILE_CONFIG = LocalCompileConfig(regions=[])
+_ACTIVE_LOCAL_COMPILE_CONFIG = LocalCompileConfig()
 
 
 def _as_local_compile_config(
