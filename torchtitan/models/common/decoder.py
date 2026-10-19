@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import dataclasses
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from torchtitan.models.common.attention import (
     FlexAttention,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
+    ScaledDotProductAttention,
     VarlenAttention,
 )
 from torchtitan.models.common.embedding import Embedding
@@ -325,6 +327,10 @@ class Decoder(BaseModel):
             return self._create_flex_attention_mask_for_document(positions, attn_config)
         elif isinstance(inner_attn, VarlenAttention.Config):
             return create_varlen_metadata_for_document(positions)
+        elif isinstance(inner_attn, ScaledDotProductAttention.Config):
+            # SDPA uses is_causal only; no explicit masks. Packed documents
+            # attend across boundaries (get_attention_config warns).
+            return None
         else:
             raise TypeError(
                 f"Only VarlenAttention and FlexAttention support attention masks, "

@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import json
 import os
@@ -53,6 +54,7 @@ class FaultTolerantTrainer(Trainer):
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
+        self.compiled_grad_clip = dist_utils.build_compiled_grad_clip(config.compile)
 
         # init distributed and build meshes (FT override handles ft_manager creation)
         self.parallel_dims = parallel_dims = self.init_distributed()
@@ -419,6 +421,7 @@ class FaultTolerantTrainer(Trainer):
             foreach=True,
             pp_mesh=parallel_dims.get_optional_mesh("pp"),
             ep_enabled=parallel_dims.ep_enabled,
+            compiled_grad_clip=self.compiled_grad_clip,
         )
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()

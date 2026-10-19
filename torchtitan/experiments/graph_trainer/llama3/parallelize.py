@@ -1,10 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
@@ -14,6 +15,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
 from torchtitan.experiments.graph_trainer.compile import apply_compile
+from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.graph_trainer.llama3.model import GraphTrainerLlama3Model
 
 
@@ -33,7 +35,7 @@ def parallelize_llama(
     parallel_dims: ParallelDims,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig,
+    compile_config: GraphTrainerCompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
@@ -60,10 +62,20 @@ def parallelize_llama(
         model.parallelize(parallel_dims)
         maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
 
+    if compile_config.mode == "jit" and ac_config is not None:
+        # JIT does not run the AOT memory-policy/remat passes, so honor the
+        # Trainer AC policy with eager wrappers before SimpleFSDP and compile.
+        ac_config.build(dump_folder=dump_folder).apply(model)
+
     # Apply simple_fsdp unconditionally. The `fsdp` mesh always exists with a
     # real backend (see ParallelDims._mesh_exist), even at degree 1, so that
     # MixedPrecisionPolicy's param_dtype cast still applies in single-GPU runs.
-    model = apply_simple_fsdp(model, parallel_dims=parallel_dims, training=training)
+    # fsdp_first: request the fsdp-outer HSDP mesh so SimpleFSDP reduce-scatters
+    # over fsdp before the dp_replicate all-reduce, avoiding the full unsharded
+    # LM-head gradient buffer that exceeds a 24 GiB core.
+    model = apply_simple_fsdp(
+        model, parallel_dims=parallel_dims, training=training, fsdp_first=True
+    )
 
     # Apply compilation based on mode
     model = apply_compile(

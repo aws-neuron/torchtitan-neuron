@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import os
 import time
@@ -257,6 +258,27 @@ def _get_metrics_rank(
     return (world_size // pp_size) * (pp_size - 1)
 
 
+def compute_mfu(
+    num_flops_per_token: int,
+    tps: float,
+    gpu_peak_flops: float,
+    has_quantization: bool,
+) -> float | None:
+    """Model FLOPS utilization (%), or None when it would be misleading.
+
+    MFU is defined against the BF16 peak FLOPS (PaLM paper,
+    https://arxiv.org/abs/2204.02311). When quantization (FP8/MX) is active the
+    BF16 peak understates the effective peak, so MFU is skipped -- except on
+    Neuron trn3 MXFP8, where the tensor-engine peak is a known 4x the BF16 peak,
+    so we report MFU against ``4 * gpu_peak_flops``.
+    """
+    if has_quantization:
+        if utils.has_neuron_capability("mxfp8"):
+            return 100 * num_flops_per_token * tps / (4 * gpu_peak_flops)
+        return None
+    return 100 * num_flops_per_token * tps / gpu_peak_flops
+
+
 class MetricsProcessor(Configurable):
     """Metrics processor to processes the metrics and log metrics.
 
@@ -477,16 +499,11 @@ class MetricsProcessor(Configurable):
         tps = self.ntokens_since_last_log / (
             time_delta * self.parallel_dims.non_data_parallel_size
         )
-        # model FLOPS utilization
-        # For its definition and calculation, please refer to the PaLM paper:
-        # https://arxiv.org/abs/2204.02311
-        # MFU is based on BF16 peak FLOPS which is misleading when quantization
-        # (FP8/MX) is active, so we skip it in that case.
+        # model FLOPS utilization (see compute_mfu for the quantization handling)
         tflops = self.num_flops_per_token * tps / 1e12
-        if self.has_quantization:
-            mfu = None
-        else:
-            mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
+        mfu = compute_mfu(
+            self.num_flops_per_token, tps, self.gpu_peak_flops, self.has_quantization
+        )
 
         time_end_to_end = time_delta / self.config.log_freq
         time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)

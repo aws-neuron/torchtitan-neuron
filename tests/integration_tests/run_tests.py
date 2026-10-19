@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import argparse
 import os
@@ -14,7 +15,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 from torchtitan.tools.logging import logger
 
-from tests.integration_tests import OverrideDefinitions
+from tests.integration_tests import _ON_NEURON, OverrideDefinitions
 from tests.integration_tests.features import build_features_test_list
 from tests.integration_tests.h100 import build_h100_tests_list
 from tests.integration_tests.models import build_model_tests_list
@@ -197,6 +198,8 @@ def _filter_tests(
             getattr(args, "gpu_arch_type", "cuda") == "rocm"
             and test_flavor.skip_rocm_test
         ):
+            continue
+        if _ON_NEURON and test_flavor.skip_neuron:
             continue
         if args.ngpu < test_flavor.ngpu:
             skipped_ngpu.append(test_flavor)

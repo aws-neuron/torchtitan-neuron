@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 """Config-based sharding helpers for MoE submodules."""
 
@@ -318,8 +319,6 @@ def set_moe_sharding_config(
                 # num_local_tokens_per_expert_E is routing metadata, but it is
                 # still a DTensor input to local_map and must have placements.
                 _tokens_per_expert_placement(enable_ep=enable_ep),
-            )
-            if enable_ep
-            else None,
+            ),
         ),
     )

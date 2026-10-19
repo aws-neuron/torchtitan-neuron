@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import re
 from collections import defaultdict
@@ -409,7 +410,7 @@ def register_moe_load_balancing_hook(
                 if getattr(transformer_block, "moe_enabled", False):
                     yield transformer_block, cast(_MoELike, transformer_block.moe)
 
-    def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
+    def _should_register_expert_bias_hook(model_parts: list[nn.Module]) -> bool:
         moe_layers = list(_iter_moe_layers(model_parts))
         if not moe_layers:
             return False
@@ -422,7 +423,15 @@ def register_moe_load_balancing_hook(
                     "across all MoE layers. Either set it for every MoE layer "
                     "or leave it unset for all MoE layers."
                 )
-        return load_balance_enabled
+        mechanisms = {
+            getattr(moe, "load_balancing", "expert_bias") for _, moe in moe_layers
+        }
+        if len(mechanisms) > 1:
+            raise ValueError(
+                "MoE load_balancing must be the same across all MoE layers"
+            )
+        # The global-batch loss has no expert bias to update.
+        return load_balance_enabled and mechanisms == {"expert_bias"}
 
     # for MoE auxiliary-loss-free load balancing
     def _is_recomputation_enabled(module):
@@ -520,7 +529,7 @@ def register_moe_load_balancing_hook(
                     moe.expert_bias_E.add_(expert_bias_delta_E)
                     moe.tokens_per_expert_E.zero_()
 
-    if _should_register_moe_balancing_hook(model_parts):
+    if _should_register_expert_bias_hook(model_parts):
         optimizers.register_step_pre_hook(
             lambda *args, **kwargs: _update_expert_bias(
                 model_parts, parallel_dims=parallel_dims

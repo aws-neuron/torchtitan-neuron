@@ -1,13 +1,11 @@
 # ---- All project specifications ---- #
 [project]
-name = "torchtitan"
+name = "torchtitan-neuron"
 description = "A PyTorch native platform for training generative AI models"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
-authors = [
-    { name = "PyTorch Team", email = "packages@pytorch.org" },
-]
+authors = [{name = "AWS Neuron Team"}]
 keywords = ["pytorch", "training", "llm"]
 dependencies = [
     # Stateful Dataloader
@@ -29,9 +27,10 @@ dependencies = [
 dynamic = ["version"]
 
 [project.urls]
-GitHub = "https://github.com/pytorch/torchtitan"
-Documentation = "https://github.com/pytorch/torchtitan/tree/main/docs"
-Issues = "https://github.com/pytorch/torchtitan/issues"
+GitHub = "https://github.com/aws-neuron/torchtitan-neuron"
+Documentation = "https://github.com/aws-neuron/torchtitan-neuron/tree/main/docs"
+Issues = "https://github.com/aws-neuron/torchtitan-neuron/issues"
+Upstream = "https://github.com/pytorch/torchtitan"
 
 [project.optional-dependencies]
 dev = [
@@ -57,10 +56,14 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = [""]
 include = ["torchtitan*"]
+exclude = ["*.tests", "*.tests.*"]
+
+[tool.setuptools.package-data]
+"torchtitan" = ["assets/**/*"]
 
 [tool.pytest.ini_options]
 addopts = ["--showlocals"]  # show local variables in tracebacks
-testpaths = ["tests"]
+testpaths = ["tests", "torchtitan_neuron/tests"]
 
 [tool.pyrefly]
 project-excludes = ["torchtitan/experiments", "**/tests/**"]

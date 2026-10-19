@@ -7,6 +7,6 @@
 from importlib.metadata import version
 
 try:
-    __version__ = version("torchtitan")
+    __version__ = version("torchtitan-neuron")
 except Exception:
     __version__ = "0.0.0+unknown"

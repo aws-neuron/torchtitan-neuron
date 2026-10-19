@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from __future__ import annotations
 
@@ -10,7 +11,8 @@ import contextlib
 import math
 import os
 from abc import abstractmethod
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Protocol, TYPE_CHECKING
 
@@ -25,8 +27,8 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Placement, Shard
 
-from torchtitan.config import CommConfig, DebugConfig
-from torchtitan.tools.logging import logger
+from torchtitan.config import CommConfig, CompileConfig, DebugConfig
+from torchtitan.tools.logging import logger, warn_once
 from torchtitan.tools.utils import device_module, device_type
 
 if TYPE_CHECKING:
@@ -549,6 +551,145 @@ def set_pg_timeouts(
         torch.distributed.set_timeout(timeout, group)
 
 
+def _compute_grouped_norm_sq(
+    grads: list[torch.Tensor],
+    weights: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    out.zero_()
+    for i, grad in enumerate(grads):
+        grad_fp32 = grad.to(torch.float32)
+        out.add_((grad_fp32 * grad_fp32).sum() * weights[i])
+
+
+def _compute_clip_coef(
+    local_norm_sq: torch.Tensor,
+    grads: list[torch.Tensor],
+    max_norm: float,
+    total_norm_out: torch.Tensor,
+) -> None:
+    total_norm_out.copy_(local_norm_sq.sqrt())
+    coef = torch.clamp(max_norm / (total_norm_out + 1e-6), max=1.0)
+    for grad in grads:
+        grad.mul_(coef)
+
+
+def _replication_weight(param: DTensor | torch.Tensor) -> float:
+    if not isinstance(param, DTensor):
+        return 1.0
+
+    replication = 1
+    for mesh_axis, placement in enumerate(param.placements):
+        if placement.is_replicate():
+            replication *= param.device_mesh.size(mesh_axis)
+    return 1.0 / replication
+
+
+@dataclass
+class _CompiledGradClipState:
+    weights: torch.Tensor
+    local_norm_sq: torch.Tensor
+    total_norm: torch.Tensor
+
+
+class CompiledGradClip:
+    """Compiled gradient clipping using the configured torch.compile backend."""
+
+    def __init__(self, backend: str) -> None:
+        self._backend = backend
+        self._norm_sq_compiled: Callable[..., None] | None = None
+        self._coef_scale_compiled: Callable[..., None] | None = None
+        self._state_cache: dict[tuple[int, ...], _CompiledGradClipState] = {}
+
+    def _get_state(
+        self,
+        params_with_grad: list[torch.Tensor],
+        device: torch.device,
+    ) -> _CompiledGradClipState:
+        parameter_key = tuple(id(param) for param in params_with_grad)
+        state = self._state_cache.get(parameter_key)
+        if state is not None:
+            return state
+
+        weights = torch.tensor(
+            [_replication_weight(param) for param in params_with_grad],
+            dtype=torch.float32,
+            device=device,
+        )
+        state = _CompiledGradClipState(
+            weights=weights,
+            local_norm_sq=torch.zeros((), dtype=torch.float32, device=device),
+            total_norm=torch.zeros((), dtype=torch.float32, device=device),
+        )
+        self._state_cache[parameter_key] = state
+        return state
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        parameters: list[torch.Tensor],
+        max_norm: float,
+    ) -> torch.Tensor:
+        params_with_grad = [param for param in parameters if param.grad is not None]
+        local_grads = []
+        for param in params_with_grad:
+            grad = param.grad
+            assert grad is not None
+            local_grads.append(grad.to_local() if isinstance(grad, DTensor) else grad)
+
+        if local_grads:
+            device = local_grads[0].device
+        elif parameters:
+            first_parameter = parameters[0]
+            device = (
+                first_parameter.to_local().device
+                if isinstance(first_parameter, DTensor)
+                else first_parameter.device
+            )
+        else:
+            device = torch.device(device_type)
+
+        state = self._get_state(params_with_grad, device)
+
+        if local_grads:
+            if self._norm_sq_compiled is None:
+                self._norm_sq_compiled = torch.compile(
+                    _compute_grouped_norm_sq,
+                    backend=self._backend,
+                    dynamic=False,
+                )
+            self._norm_sq_compiled(local_grads, state.weights, state.local_norm_sq)
+        else:
+            state.local_norm_sq.zero_()
+        dist.all_reduce(state.local_norm_sq, op=dist.ReduceOp.SUM)
+
+        if local_grads:
+            if self._coef_scale_compiled is None:
+                self._coef_scale_compiled = torch.compile(
+                    _compute_clip_coef,
+                    backend=self._backend,
+                    dynamic=False,
+                )
+            self._coef_scale_compiled(
+                state.local_norm_sq,
+                local_grads,
+                max_norm,
+                state.total_norm,
+            )
+        else:
+            state.total_norm.copy_(state.local_norm_sq.sqrt())
+        return state.total_norm
+
+
+def build_compiled_grad_clip(
+    compile_config: CompileConfig,
+) -> CompiledGradClip | None:
+    """Build compiled gradient clipping when selected by the compile config."""
+    if compile_config.enable and "grad_clip" in compile_config.components:
+        return CompiledGradClip(compile_config.backend)
+    return None
+
+
 @torch.no_grad()
 def clip_grad_norm_(
     parameters: torch.Tensor | Iterable[torch.Tensor],
@@ -558,6 +699,7 @@ def clip_grad_norm_(
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
     ep_enabled: bool = False,
+    compiled_grad_clip: CompiledGradClip | None = None,
 ) -> torch.Tensor:
     """
     Clip the gradient norm of an iterable of parameters.
@@ -582,11 +724,37 @@ def clip_grad_norm_(
         pp_mesh: Pipeline Parallel device mesh. If not None, will reduce gradient norm across PP stages.
         ep_dense_params_mesh_ndim: Mesh ndim of the dense params when EP is used. If EP is not used,
             set it to ``None``.
+        compiled_grad_clip: optional compiled gradient clipping implementation.
 
     Returns:
         Total norm of the parameter gradients (viewed as a single vector).
 
     """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    else:
+        parameters = list(parameters)
+
+    if compiled_grad_clip is not None:
+        unsupported_reasons = []
+        if pp_mesh is not None:
+            unsupported_reasons.append("pipeline parallelism is enabled")
+        if ep_enabled:
+            unsupported_reasons.append("expert parallelism is enabled")
+        if norm_type != 2.0:
+            unsupported_reasons.append(f"norm_type is {norm_type}, not 2.0")
+        if error_if_nonfinite:
+            unsupported_reasons.append("error_if_nonfinite is enabled")
+
+        if not unsupported_reasons:
+            return compiled_grad_clip(parameters, max_norm)
+
+        warn_once(
+            logger,
+            "Compiled gradient clipping was requested but cannot be applied because "
+            f"{', '.join(unsupported_reasons)}; falling back to eager clipping.",
+        )
+
     if ep_enabled:
         return _clip_grad_norm_with_ep(
             parameters,
@@ -597,11 +765,6 @@ def clip_grad_norm_(
             pp_mesh,
         )
 
-    if isinstance(parameters, torch.Tensor):
-        parameters = [parameters]
-    else:
-        # prevent generators from being exhausted
-        parameters = list(parameters)
     grads = [p.grad for p in parameters if p.grad is not None]
     total_norm = torch.nn.utils.get_total_norm(
         grads, norm_type, error_if_nonfinite, foreach

@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from dataclasses import dataclass
 from typing import cast, ClassVar
@@ -18,6 +19,13 @@ from torchtitan.distributed.minimal_async_ep import (
     dispatch_op as minimal_async_ep_dispatch_op,
     init_buffer as minimal_async_ep_init_buffer,
     MinimalAsyncEPDispatchMetadata,
+)
+from torchtitan.distributed.neuron_ep import (
+    build_ep_replica_group_ranks,
+    build_packed_source_indices,
+    gmm_align,
+    permute_a2av_dispatch_compact,
+    unpermute_a2av_combine_packed,
 )
 from torchtitan.distributed.spmd_types import current_spmd_mesh, maybe_set_sparse_mesh
 from torchtitan.distributed.utils import get_spmd_backend
@@ -41,6 +49,26 @@ class AllToAllDispatchMetadata(LocalDispatchMetadata):
     permuted_indices: torch.Tensor  # for _unpermute
     input_splits: list[int]
     output_splits: list[int]
+
+
+@dataclass(frozen=True, kw_only=True)
+class NeuronEPDispatchMetadata(LocalDispatchMetadata):
+    """Metadata returned by NeuronEPTokenDispatcher.dispatch() for use in combine().
+
+    ``token_indices_experts_sorted_N`` / ``topk_scores_experts_sorted_N`` are the
+    pre-expanded (N = T*top_k) per-row token-id and gate-score maps, index-aligned
+    with the kernel's ``routed_input_ND`` rows so combine can apply scores and
+    scatter-add back to T tokens. They are TOKEN-MAJOR (``arange(N)//top_k`` and
+    ``topk_scores_TK.reshape(-1)``): the dispatcher leaves the expert-sort to the
+    kernel's packed-index permute, so combine relies only on 1:1 alignment with
+    the kernel row order, not on the ordering being expert-sorted. (The field names
+    keep the ``_experts_sorted_N`` suffix for historical/dataclass compatibility.)
+    """
+
+    send_counts_1E: torch.Tensor  # noqa: N815  # int32 [1, EP], rows sent per dest
+    recv_counts_1E: torch.Tensor  # noqa: N815  # int32 [1, EP], rows received per source
+    compact_capacity: int  # row count of the packed [C,H] expert buffer
+    packed_source_indices_N: torch.Tensor  # noqa: N815
 
 
 class LocalTokenDispatcher(Configurable):
@@ -744,6 +772,321 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         out_unpermuted_RD = routed_output_RD.new_empty(input_shape)
         out_unpermuted_RD[permuted_indices, :] = routed_output_RD
         return out_unpermuted_RD[:-1]
+
+
+class NeuronEPTokenDispatcher(BaseEPTokenDispatcher):
+    """EP token dispatcher backed by Neuron NKI all-to-all-v kernels.
+
+    Design:
+
+    1. Packed capacity. The supported EP path requires
+       ``num_local_experts == 1`` and sends real per-destination counts into a
+       packed ``[C,H]`` receive buffer. The aligned capacity
+       ``C = FSDP * local_batch * global_sequence_length`` is the unique-token
+       count represented by the EP group. With multiple local experts, capacity
+       scales by ``min(top_k, num_local_experts)`` once that path is enabled.
+       The kernel output is ``[C,H]``, so its element count is ``C * H``. Its
+       NKI kernel overlaps the count exchange with local payload packing.
+
+    2. Token-major kernel input. Feeds the NKI ``permute_a2av`` kernel a TOKEN-MAJOR
+       ``routed_input_ND`` (row ``r = t*K + k`` = token ``t`` replicated for its k-th
+       expert choice) and lets the kernel's packed vector do the routing sort
+       in a single pass -- no glue-side argsort + gather.
+
+    The published kernels currently require Trn3, LNC=2, EP >= 8, and complete
+    four-rank device groups. Multi-local-expert packed regrouping is a separate
+    milestone because source-major receive counts do not identify local experts.
+
+    Scope: EP with ``num_experts % ep_size == 0``. TP/SP (``sp_size > 1``) is supported
+    -- routing is unaffected by the sequence shard (the packed vector keys off expert ids
+    only, and the a2a-v round-trip preserves per-row identity), so SP only offsets the
+    final scatter in ``combine`` to global token positions. CP is not supported.
+
+    Tensor shape suffixes (module-local): ``N`` routed rows (T*top_k), ``D``/``H`` hidden,
+    ``E`` EP degree, ``e`` local experts per rank, and ``C`` packed receive capacity.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseEPTokenDispatcher.Config):
+        # Optional per-source capacity override. The packed buffer has
+        # EP*min(top_k, num_local_experts)*capacity_per_expert rows when set.
+        capacity_per_expert: int | None = None
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self._cap_override = config.capacity_per_expert
+        # Full SPMD replica-group rank lists for nki.collectives.ReplicaGroup,
+        # set in wire_meshes once the EP mesh is known.
+        self._ep_ranks: list[list[int]] | None = None
+
+    def wire_meshes(self, *, ep_mesh, tp_mesh) -> None:
+        super().wire_meshes(ep_mesh=ep_mesh, tp_mesh=tp_mesh)
+        if ep_mesh is not None:
+            if self.num_experts % ep_mesh.size() != 0:
+                raise ValueError(
+                    f"neuron_ep requires num_experts ({self.num_experts}) divisible by "
+                    f"ep_size ({ep_mesh.size()})."
+                )
+            self._ep_ranks = build_ep_replica_group_ranks(ep_mesh)
+
+    def _packed_capacity(
+        self,
+        local_token_count: int,
+        ep_size: int,
+        num_local_experts: int,
+    ) -> int:
+        """Return the grouped-mm-aligned dropless receive capacity.
+
+        ``local_token_count * ep_size`` equals
+        ``FSDP * local_batch * global_sequence_length`` for the EP/TP mesh.
+        A token can target at most ``min(top_k, num_local_experts)`` experts on
+        one destination rank because its top-k expert IDs are distinct.
+        """
+        alignment = gmm_align()
+        expert_multiplier = min(self.top_k, num_local_experts)
+        model_capacity = local_token_count * ep_size * expert_multiplier
+        capacity = model_capacity
+        if self._cap_override is not None:
+            capacity = ep_size * expert_multiplier * self._cap_override
+            if capacity < model_capacity:
+                raise ValueError(
+                    "compact neuron_ep requires "
+                    "EP*min(top_k,num_local_experts)*capacity_per_expert "
+                    ">= model capacity "
+                    f"({ep_size}*{expert_multiplier}*{self._cap_override}="
+                    f"{capacity} < {model_capacity})."
+                )
+        return ((capacity + alignment - 1) // alignment) * alignment
+
+    def _build_packed_routing(
+        self,
+        topk_expert_ids_TK: torch.Tensor,
+        num_local_tokens_per_expert_E: torch.Tensor,
+    ):
+        """Build stable destination-major routing for one local expert per rank.
+
+        Returns ``(counts[1, EP], source_indices[N])``. Peer segments preserve
+        token-major arrival order, with every routed row appearing exactly once.
+        """
+        # The router already counts local tokens for each expert. With one expert
+        # per rank and distinct top-k choices, these are exactly the peer counts.
+        send_counts_1E = num_local_tokens_per_expert_E.to(torch.int32).view(1, -1)
+        packed_source_indices_N = build_packed_source_indices(
+            topk_expert_ids_TK.reshape(-1), send_counts_1E
+        )
+        return send_counts_1E, packed_source_indices_N
+
+    def _dispatch_compact(
+        self,
+        routed_input_ND: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        token_indices_per_row_N: torch.Tensor,
+        topk_scores_per_row_N: torch.Tensor,
+        num_local_tokens_per_expert_E: torch.Tensor,
+        recv_capacity: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, NeuronEPDispatchMetadata]:
+        """num_local_experts == 1 compact dispatch: send only real rows.
+
+        Builds a contiguous destination-major source-index vector. The packed kernel issues the
+        count exchange before local packing and delays synchronization until the
+        received counts are consumed, permitting the compiler to overlap them. It
+        receives directly into the static ``[recv_capacity, H]`` expert buffer.
+        """
+        device = routed_input_ND.device
+        send_counts_1E, packed_source_indices_N = self._build_packed_routing(
+            topk_expert_ids_TK, num_local_tokens_per_expert_E
+        )
+        # recv_counts is a kernel OUTPUT (variable-count a2a-v derives it internally).
+        routed_input_RD, recv_counts_1E = permute_a2av_dispatch_compact(
+            routed_input_ND,
+            packed_source_indices_N,
+            send_counts_1E,
+            recv_capacity,
+            self._ep_ranks,
+        )
+        padded_counts_e = torch.full(
+            (1,), recv_capacity, dtype=torch.int32, device=device
+        )
+        metadata = NeuronEPDispatchMetadata(
+            token_indices_experts_sorted_N=token_indices_per_row_N,
+            topk_scores_experts_sorted_N=topk_scores_per_row_N,
+            send_counts_1E=send_counts_1E,
+            recv_counts_1E=recv_counts_1E,
+            compact_capacity=recv_capacity,
+            packed_source_indices_N=packed_source_indices_N,
+        )
+        return routed_input_RD, padded_counts_e, metadata
+
+    # pyrefly: ignore [bad-override]
+    def dispatch(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        num_local_tokens_per_expert_E: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, NeuronEPDispatchMetadata]:
+        """Packed dispatch through the published NKILib A2AV API.
+
+        The glue does not expert-sort on the send side. We expand ``x_TD`` to
+        token-major ``routed_input_ND`` (row r = t*K + k = token t replicated for
+        its k-th expert) and let the kernel gather rows from the packed vector.
+        """
+        if self.ep_mesh is None:
+            # Local (EP=1) fallback: unchanged. LocalTokenDispatcher.dispatch still
+            # does expert-sort on the send side and consumes num_local_tokens_per_expert_E
+            # verbatim; only the EP path benefits from the token-major kernel-permute layout.
+            return LocalTokenDispatcher.dispatch(
+                self,
+                x_TD,
+                topk_scores_TK,
+                topk_expert_ids_TK,
+                num_local_tokens_per_expert_E,
+            )
+        assert self._ep_ranks is not None
+        ep_size = self.ep_mesh.size()
+        num_local_experts = self.num_experts // ep_size
+        t = x_TD.shape[0]
+        k = topk_expert_ids_TK.shape[1]
+        if topk_expert_ids_TK.shape != topk_scores_TK.shape:
+            raise ValueError(
+                "neuron_ep requires matching top-k score and expert-id shapes; "
+                f"got {tuple(topk_scores_TK.shape)} and "
+                f"{tuple(topk_expert_ids_TK.shape)}."
+            )
+        expected_routing_shape = (t, self.top_k)
+        if topk_expert_ids_TK.shape != expected_routing_shape:
+            raise ValueError(
+                "neuron_ep requires routing shape "
+                f"{expected_routing_shape}. Got {tuple(topk_expert_ids_TK.shape)}."
+            )
+        if ep_size < 8 or ep_size % 4 != 0:
+            raise ValueError(
+                "packed neuron_ep requires ep_size >= 8 in complete four-rank "
+                f"Trn3 device groups. Got {ep_size}."
+            )
+        n = t * k
+        if num_local_experts != 1:
+            raise ValueError(
+                "packed neuron_ep currently requires num_local_experts == 1; "
+                f"got num_experts={self.num_experts}, ep_size={ep_size}, "
+                f"num_local_experts={num_local_experts}."
+            )
+
+        # Token-major expansion: row r = t*K + k is token t's embedding, repeated K
+        # times contiguously. Only routing indices are sorted; the kernel gathers
+        # the hidden-state rows via packed source indices.
+        routed_input_ND = x_TD.repeat_interleave(k, dim=0)
+        # Per-row metadata index-aligned with routed_input_ND rows:
+        #   token_indices_per_row_N[r] = t   = origin token id (for combine scatter_add)
+        #   topk_scores_per_row_N[r]   = s_tk = gate score for that (token, expert) pair
+        # Kept in the NeuronEPDispatchMetadata fields named ``*_experts_sorted_N`` (a
+        # historical name): the data is token-major, not expert-sorted, but combine
+        # only needs 1:1 alignment with the kernel row order.
+        arange_N = torch.arange(n, device=x_TD.device)
+        token_indices_per_row_N = arange_N // k
+        topk_scores_per_row_N = topk_scores_TK.reshape(-1)
+
+        # The kernel's per-source recv_counts are also per-(source, expert) when
+        # num_local_experts == 1.
+        return self._dispatch_compact(
+            routed_input_ND,
+            topk_expert_ids_TK,
+            token_indices_per_row_N,
+            topk_scores_per_row_N,
+            num_local_tokens_per_expert_E,
+            self._packed_capacity(t, ep_size, num_local_experts),
+        )
+
+    # pyrefly: ignore [bad-override]
+    def combine(
+        self,
+        routed_output_RD: torch.Tensor,
+        metadata: NeuronEPDispatchMetadata,
+        x_TD: torch.Tensor,
+        *,
+        num_local_tokens_after_padding: int,
+        local_seq_len_after_padding: int,
+    ) -> torch.Tensor:
+        """Run packed NKI combine, apply scores, and reduce routed rows N -> tokens T.
+
+        The EP path consumes the packed ``[C,H]`` expert output directly.
+        Metadata's ``*_experts_sorted_N`` fields carry token-major (per-row)
+        values -- see ``dispatch`` -- but combine treats them as opaque
+        row-aligned indices/scores.
+
+        With SP (``sp_size > 1``) each rank holds only a ``1/sp_size`` slice of the
+        sequence, so ``token_indices_experts_sorted_N`` are LOCAL token ids. They are
+        offset to GLOBAL positions here and scattered into a global-length buffer, so
+        every SP rank writes a DISJOINT slice (zeros elsewhere). The MoE forward output
+        is declared ``Partial(tp) -> Shard(seq)`` in ``set_moe_sharding_config``, and
+        that DTensor redistribution reduce-scatters these disjoint slices back into a
+        per-rank sequence shard -- which is why the buffer must be global-length and why
+        no TP collective belongs here. This mirrors ``AllToAllTokenDispatcher.combine``
+        (the SP remap is combine-only in both: dispatch keeps indices local because it
+        indexes local tensors).
+        """
+        if self.ep_mesh is None:
+            return LocalTokenDispatcher.combine(
+                self,
+                routed_output_RD,
+                metadata,
+                x_TD,
+                num_local_tokens_after_padding=num_local_tokens_after_padding,
+                local_seq_len_after_padding=local_seq_len_after_padding,
+            )
+        assert self._ep_ranks is not None
+
+        if routed_output_RD.shape[0] != metadata.compact_capacity:
+            raise ValueError(
+                "neuron_ep compact combine expects expert output with "
+                f"capacity ({metadata.compact_capacity}) rows. "
+                f"got {routed_output_RD.shape[0]}."
+            )
+        combined_ND = unpermute_a2av_combine_packed(
+            routed_output_RD,
+            metadata.packed_source_indices_N,
+            metadata.send_counts_1E,
+            metadata.recv_counts_1E,
+            self._ep_ranks,
+        )
+
+        combined_ND = (
+            combined_ND.to(torch.float32)
+            * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
+        ).to(x_TD.dtype)
+        dim = x_TD.shape[-1]
+        if self.sp_size > 1:
+            # Global-length buffer: this rank fills only its own disjoint slice (via the
+            # sp_rank offset below); the downstream Partial -> Shard(seq) redistribution
+            # reassembles all SP ranks' slices. moe.py pads the sequence to a multiple of
+            # sp_size before dispatch, which keeps the per-rank token count uniform --
+            # the packed receive layout relies on that uniformity.
+            out_TD = torch.zeros(
+                num_local_tokens_after_padding * self.sp_size,
+                dim,
+                device=x_TD.device,
+                dtype=x_TD.dtype,
+            )
+            token_indices_N = self._sp_global_token_indices(
+                metadata.token_indices_experts_sorted_N,
+                local_seq_len_after_padding,
+            )
+        else:
+            out_TD = torch.zeros_like(x_TD)
+            token_indices_N = metadata.token_indices_experts_sorted_N
+        # TODO: Replace this with a fixed-order NKI token-reduction kernel
+        # that provides deterministic scatter-add semantics on Neuron.
+        # Native Neuron scatter-add is compilable but does not guarantee reduction order.
+        # Functionally equivalent to Tensor.scatter_add in eager mode. Use the
+        # explicit ATen overload so AOT capture preserves a Torch-MLIR-recognized
+        # operator target.
+        out_TD = torch.ops.aten.scatter_add.default(
+            out_TD,
+            0,
+            token_indices_N.reshape(-1, 1).expand(-1, dim),
+            combined_ND,
+        )
+        return out_TD
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 # Shape suffix legend
 # (https://medium.com/@NoamShazeer/shape-suffixes-good-coding-style-f836e72e24fd):
@@ -44,6 +45,10 @@ from torchtitan.distributed.utils import get_spmd_backend, is_in_batch_invariant
 
 from torchtitan.models.common.nn_modules import Linear, RMSNorm
 from torchtitan.models.common.rope import RoPE
+from torchtitan.protocols.checkpoint_load import (
+    FusedQKVLoadTarget,
+    is_fused_qkv_load_planning,
+)
 from torchtitan.protocols.module import Module
 from torchtitan.tools.utils import round_up
 
@@ -750,7 +755,7 @@ class FusedQKVLinear(BaseQKVLinear):
     @spmd.local_map(
         out_types=({"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},) * 3
     )
-    def forward(  # pyrefly: ignore[bad-override]
+    def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bs, seqlen, _ = x.shape
@@ -808,6 +813,27 @@ class FusedQKVLinear(BaseQKVLinear):
             if key not in state_dict:
                 continue
             tensor = state_dict.pop(key)
+            n_kv = tensor.shape[0] // (r * hd)
+            tail = (tensor.shape[1],) if ndim == 4 else ()
+
+            if is_fused_qkv_load_planning():
+                projection_shapes = {
+                    "q": torch.Size((n_kv * hpk * hd, *tail)),
+                    "k": torch.Size((n_kv * hd, *tail)),
+                    "v": torch.Size((n_kv * hd, *tail)),
+                }
+                for projection, shape in projection_shapes.items():
+                    state_dict[f"{prefix}w{projection}.{param}"] = FusedQKVLoadTarget(
+                        fused_tensor=tensor,
+                        projection=projection,
+                        shape=shape,
+                        dtype=tensor.dtype,
+                        n_kv_heads=n_kv,
+                        heads_per_kv=hpk,
+                        head_dim=hd,
+                    )
+                continue
+
             # Gather to Replicate so the n_kv-leading reshape is local (dim 0
             # unsharded) when a Shard(0) split would not divide n_kv_heads
             # (e.g. dp_shard=8, n_kv_heads=4); stays a DTensor for the copy.
@@ -815,8 +841,6 @@ class FusedQKVLinear(BaseQKVLinear):
                 tensor = tensor.redistribute(
                     tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim
                 )
-            n_kv = tensor.shape[0] // (r * hd)
-            tail = (tensor.shape[1],) if ndim == 4 else ()
             w = tensor.reshape(n_kv, r, hd, *tail)
             state_dict[f"{prefix}wq.{param}"] = (
                 w[:, :hpk].reshape(-1, *tail).contiguous()

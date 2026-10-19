@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import contextlib
 import unittest
@@ -48,10 +49,14 @@ class TestCrossEntropyDTensor(DTensorTestBase):
             labels_pl = (Replicate(),)
 
         B, S, V = 4, 16, 64
-        gen = torch.Generator(device=self.device_type).manual_seed(42)
-        global_pred = torch.randn(B, S, V, device=self.device_type, generator=gen)
-        global_labels = torch.randint(
-            0, V, (B, S), device=self.device_type, dtype=torch.long, generator=gen
+        # Seed a CPU generator and move to the test device: some accelerators
+        # (e.g. neuron) do not provide a device-side RNG generator. The parity
+        # checks below compare two computations over the same data, so the
+        # exact RNG stream does not matter as long as it is deterministic.
+        gen = torch.Generator().manual_seed(42)
+        global_pred = torch.randn(B, S, V, generator=gen).to(self.device_type)
+        global_labels = torch.randint(0, V, (B, S), dtype=torch.long, generator=gen).to(
+            self.device_type
         )
 
         ref_loss = _reference_ce(global_pred, global_labels)

@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from typing import TYPE_CHECKING
 
@@ -115,10 +116,18 @@ def _set_gpt_oss_layer_sharding(
     set_qkv_linear_sharding(attention.qkv_linear)
     attention.wo.sharding_config = scaled_bias_rowwise_config(output_sp=enable_sp)
 
-    set_gqa_inner_attention_local_map(attention.inner_attention)
+    # Inner attentions with their own kernel layout (e.g. the Neuron NKI
+    # wrapper) set their own local-region placements.
+    if hasattr(attention.inner_attention, "set_sharding_config"):
+        attention.inner_attention.set_sharding_config()
+    else:
+        set_gqa_inner_attention_local_map(attention.inner_attention)
 
     # MoE FFN (all GPT-OSS blocks are MoE).
     if layer_cfg.moe is not None:
+        if hasattr(layer_cfg.moe, "set_sharding_config"):
+            layer_cfg.moe.set_sharding_config(enable_sp=enable_sp, enable_ep=enable_ep)
+            return
         set_moe_sharding_config(
             layer_cfg.moe,
             enable_ep=enable_ep,

@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 from typing import TYPE_CHECKING
 
@@ -135,6 +136,9 @@ def _set_deepseek_v3_layer_sharding(
 
     # MoE FFN (MoE-enabled layers only).
     if layer_cfg.moe is not None:
+        if hasattr(layer_cfg.moe, "set_sharding_config"):
+            layer_cfg.moe.set_sharding_config(enable_sp=enable_sp, enable_ep=enable_ep)
+            return
         set_moe_sharding_config(
             layer_cfg.moe,
             enable_ep=enable_ep,

@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import dataclasses
 from collections.abc import Callable
@@ -23,6 +24,7 @@ from torchtitan.models.common import (
 from torchtitan.models.common.attention import (
     FusedQKVLinear,
     QKVLinear,
+    ScaledDotProductAttention,
     VarlenAttention,
 )
 from torchtitan.models.common.config_utils import (
@@ -89,13 +91,34 @@ def _make_gptoss_attn_config(
     Sinks also use depth-scaled init.
     """
 
-    inner_attention = get_attention_config(attn_backend)
+    if attn_backend == "nki":
+        from torchtitan_neuron.models.gpt_oss.nki_attention import (
+            NKIFlashAttentionWrapper,
+        )
+
+        inner_attention = NKIFlashAttentionWrapper.Config(
+            softmax_scale=head_dim**-0.5,
+            sliding_window=sliding_window_size,
+        )
+    else:
+        inner_attention = get_attention_config(attn_backend)
 
     if sliding_window_size is not None and isinstance(
         inner_attention, VarlenAttention.Config
     ):
         inner_attention = dataclasses.replace(
             inner_attention, window_size=(sliding_window_size - 1, 0)
+        )
+
+    if sliding_window_size is not None and isinstance(
+        inner_attention, ScaledDotProductAttention.Config
+    ):
+        # Only varlen (window_size) and flex (mask mod) can express the
+        # window; SDPA would silently run full attention on window layers.
+        raise ValueError(
+            "attn_backend='sdpa' cannot express sliding-window attention "
+            f"(sliding_window_size={sliding_window_size}); use 'varlen', "
+            "'flex', or 'nki'"
         )
 
     sinks_init = {

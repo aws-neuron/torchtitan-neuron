@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Modifications Copyright (c) Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the BSD-3-Clause license.
 
 import copy
 import importlib.util
@@ -14,13 +15,18 @@ import tempfile
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
+from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
 from torch.distributed._composable.fsdp import fully_shard
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import distribute_tensor, Shard
 from torch.testing._internal.common_fsdp import FSDPTest
 
 from torchtitan.components.loss import cross_entropy_loss
 from torchtitan.distributed import ParallelDims
+from torchtitan.experiments.graph_trainer import simple_fsdp
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
 
 
@@ -667,6 +673,71 @@ class TestGraphTrainerAutoParallelNumerics(unittest.TestCase):
 
 
 class TestSimpleFSDP(FSDPTest):
+    def test_composed_sharding_metadata(self):
+        if self.world_size < 4 or self.world_size % 4:
+            self.skipTest("Requires a multiple of four devices")
+        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
+        device = (
+            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
+        )
+        mesh = init_device_mesh(
+            device_type,
+            (self.world_size // 4, 2, 2),
+            mesh_dim_names=("replica", "fsdp", "tp"),
+        )
+        dp_mesh, tp_mesh = mesh["fsdp"], mesh["tp"]
+        original_redistribute = simple_fsdp.redistribute_local_tensor
+
+        def check_local_metadata(local, *, current_spec, target_spec):
+            for spec in (current_spec, target_spec):
+                self.assertEqual(spec.shape, local.shape)
+                self.assertEqual(spec.tensor_meta.stride, local.stride())
+                self.assertEqual(spec.tensor_meta.dtype, local.dtype)
+            return original_redistribute(
+                local, current_spec=current_spec, target_spec=target_spec
+            )
+
+        # Cover uneven DP, uneven TP, an empty DP shard, and an even control.
+        for num_rows in (10, 7, 2, 12):
+            with self.subTest(num_rows=num_rows):
+                full = torch.arange(
+                    num_rows * 8, dtype=torch.float64, device=device
+                ).reshape(num_rows, 8)
+                tp = distribute_tensor(full, tp_mesh, (Shard(0),))
+                expected_tp = full.chunk(2, dim=0)[tp_mesh.get_local_rank()]
+                chunks = expected_tp.chunk(2, dim=0)
+                dp_rank = dp_mesh.get_local_rank()
+                expected_shard = (
+                    chunks[dp_rank]
+                    if dp_rank < len(chunks)
+                    else expected_tp.narrow(0, 0, 0)
+                )
+                with patch.object(
+                    simple_fsdp, "redistribute_local_tensor", check_local_metadata
+                ):
+                    parameter = torch.nn.Parameter(
+                        simple_fsdp._distribute_dtensor(tp, dp_mesh, (Shard(0),))
+                    )
+                torch.testing.assert_close(
+                    parameter.to_local(), expected_shard, rtol=0, atol=0
+                )
+                replicate = simple_fsdp.ReplicateComputation(
+                    dp_mesh, (Shard(0),), "fully_shard", None
+                )
+                output = replicate(parameter)
+                self.assertEqual(output.shape, full.shape)
+                self.assertEqual(output.stride(), full.stride())
+                torch.testing.assert_close(
+                    output.to_local(), expected_tp, rtol=0, atol=0
+                )
+                output.to_local().square().sum().backward()
+                torch.testing.assert_close(
+                    parameter.grad.to_local(),
+                    expected_shard * (2 * dp_mesh.size()),
+                    rtol=0,
+                    atol=0,
+                )
+
     def init_test(self):
         self.optimizer = torch.optim.Adam
         self.loss_fn = cross_entropy_loss
