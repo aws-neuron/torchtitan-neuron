@@ -14,7 +14,7 @@ import torch
 
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.local_compile import apply_local_compile
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
 
 from .module import Module
@@ -86,10 +86,12 @@ class BaseModel(Module, ABC):
         Subclasses define model-specific hyperparameters.
         """
 
-        local_compile_regions: list[str] = field(default_factory=list)
-        """``@local_compile`` regions this model compiles; ``[]`` runs them all eager.
+        local_compile_regions: LocalCompileConfig = field(
+            default_factory=LocalCompileConfig
+        )
+        """Configuration for named regions, FlexAttention, and block-mask helpers.
 
-        FlexAttention manages its own compilation and is not controlled by this list.
+        An empty ``regions`` list runs named regions eagerly.
         """
 
         @abstractmethod
@@ -132,13 +134,13 @@ class BaseModel(Module, ABC):
         parallelism_context: ParallelismContext,
         training: TrainingConfig,
         parallelism: ParallelismConfig,
-        local_compile_regions: list[str],
+        local_compile_regions: LocalCompileConfig,
         activation_remat: ActivationRematConfig | None,
         dump_folder: str,
     ) -> Self:
         """Apply the ordered model-level parallelization lifecycle."""
         # Bind local implementations early; torch.compile traces on first use.
-        apply_local_compile(local_compile_regions)
+        local_compile_regions.apply()
         with parallelism_context.activate_spmd():
             self._parallelize(parallelism_context)
             if activation_remat is not None:

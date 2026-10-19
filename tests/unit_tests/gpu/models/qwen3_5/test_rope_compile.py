@@ -8,7 +8,7 @@ import unittest
 
 import torch
 
-from torchtitan.distributed.local_compile import apply_local_compile
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.common.rope import CosSinRoPE
 from torchtitan.models.qwen3_5.rope import MRoPE
 
@@ -16,10 +16,10 @@ from torchtitan.models.qwen3_5.rope import MRoPE
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestRoPELocalCompile(unittest.TestCase):
     def setUp(self):
-        apply_local_compile(["cos_sin_rope"])
+        LocalCompileConfig(regions=["cos_sin_rope"]).apply()
 
     def tearDown(self):
-        apply_local_compile([])
+        LocalCompileConfig().apply()
         torch._dynamo.reset()
 
     def test_forward_and_backward_emit_triton(self):
@@ -89,7 +89,7 @@ class TestRoPELocalCompile(unittest.TestCase):
             (grad_query_out, grad_key_out),
         )
 
-        apply_local_compile([])
+        LocalCompileConfig().apply()
         eager_rope = (
             CosSinRoPE.Config(
                 dim=128,
@@ -222,7 +222,7 @@ class TestRoPELocalCompile(unittest.TestCase):
             (grad_query_out, grad_key_out),
         )
 
-        apply_local_compile([])
+        LocalCompileConfig().apply()
         eager_rope = config.build().cuda()
         eager_query = query.detach().clone().requires_grad_()
         eager_key = key.detach().clone().requires_grad_()

@@ -17,6 +17,7 @@ from torch import nn
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import ActivationRematConfig
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import (
@@ -216,13 +217,15 @@ class GptOssModel(Decoder):
     class Config(Decoder.Config):
         dim: int = 2880
         vocab_size: int = 201088
-        local_compile_regions: list[str] = field(
-            default_factory=lambda: [
-                "loss",
-                "fused_binary_activation",
-                "cos_sin_rope",
-                "fp32_to_bf16_split",
-            ]
+        local_compile_regions: LocalCompileConfig = field(
+            default_factory=lambda: LocalCompileConfig(
+                regions=[
+                    "loss",
+                    "fused_binary_activation",
+                    "cos_sin_rope",
+                    "fp32_to_bf16_split",
+                ]
+            )
         )
 
         def get_nparams_and_flops(
@@ -250,7 +253,7 @@ class GptOssModel(Decoder):
         parallelism_context: ParallelismContext,
         training: TrainingConfig,
         parallelism: ParallelismConfig,
-        local_compile_regions: list[str],
+        local_compile_regions: LocalCompileConfig,
         activation_remat: ActivationRematConfig | None,
         dump_folder: str,
     ) -> GptOssModel:

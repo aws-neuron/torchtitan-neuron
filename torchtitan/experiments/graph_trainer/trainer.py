@@ -66,11 +66,11 @@ class GraphTrainingEngine(TrainingEngine):
     ) -> None:
         if config.optim.enable_cuda_graph:
             raise ValueError("Optim CUDA graphs are not supported with GraphTrainer.")
-        if model_config.local_compile_regions:
+        if model_config.local_compile_regions.regions:
             raise ValueError(
                 "GraphTrainer traces the whole step into one graph; set "
-                "model.local_compile_regions = [] "
-                f"(got {model_config.local_compile_regions})."
+                "model.local_compile_regions.regions = [] "
+                f"(got {model_config.local_compile_regions.regions})."
             )
         if config.parallelism.fsdp_symm_mem_scope is not None:
             raise ValueError(
@@ -359,7 +359,10 @@ class GraphTrainer(Trainer):
         compile: GraphTrainerCompileConfig = field(
             default_factory=GraphTrainerCompileConfig
         )
-        """Whole-step compile. GraphTrainer requires ``model.local_compile_regions`` to be empty."""
+        """Whole-step compile.
+
+        GraphTrainer requires ``model.local_compile_regions.regions`` to be empty.
+        """
 
         def __post_init__(self) -> None:
             Trainer.Config.__post_init__(self)
