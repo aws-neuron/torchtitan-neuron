@@ -1,173 +1,77 @@
-<div align="center">
+# TorchTitan Neuron
 
-# torchtitan
+TorchTitan Neuron is the AWS Neuron's extension of [pytorch/torchtitan](https://github.com/pytorch/torchtitan). It adds AWS Trainium support through [TorchNeuron](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/torch/about-pytorch-neuron.html), the native PyTorch backend for Neuron. The Neuron-specific recipes, NKI kernel integrations, and docs are in [`torchtitan_neuron/`](torchtitan_neuron/README.md).
 
-#### A PyTorch native platform for training generative AI models
+## Support matrix
 
-[![8 GPU Feature Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_features.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_features.yaml?query=branch%3Amain)
-[![8 GPU Model Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_models.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_models.yaml?query=branch%3Amain)
-[![arXiv](https://img.shields.io/badge/arXiv-2410.06511-b31b1b.svg)](https://arxiv.org/abs/2410.06511)
-[![ICLR](https://img.shields.io/badge/ICLR-2025-violet.svg)](https://iclr.cc/virtual/2025/poster/29620)
-[![forum](https://img.shields.io/badge/pytorch-forum-DE3412.svg)](https://discuss.pytorch.org/c/distributed/torchtitan/44)
-[![license](https://img.shields.io/badge/license-BSD_3--Clause-lightgrey.svg)](./LICENSE)
-[![pip](https://img.shields.io/pypi/v/torchtitan?color=blue)](https://pypi.org/project/torchtitan/)
-[![conda](https://img.shields.io/conda/vn/conda-forge/torchtitan?color=green)](https://anaconda.org/conda-forge/torchtitan)
+| Component | Supported version |
+|---|---|
+| Neuron SDK | 2.33.0 (TorchNeuron public beta) |
+| PyTorch / `torch-neuronx` | 2.14.0 / 2.14.3.0.* |
+| Python | 3.12, 3.13, 3.14 (Linux x86_64) |
+| Instances | Trn2, Trn3 |
+| Execution | Eager, and `torch.compile` with `--compile.backend neuron` (static shapes only) |
+| Models | Llama3, Qwen3, DeepSeek-V3, GPT-OSS |
+| Parallelism | FSDP2, SimpleFSDP, TP, CP, EP, PP, DDP, activation checkpointing |
 
+## Quick start
 
-</div>
-
-`torchtitan` is under extensive development. To use the latest features of `torchtitan`, we recommend using the most recent PyTorch nightly.
-
-
-## Latest News
-- [2025/11] AMD released an [optimized fork](https://github.com/AMD-AGI/torchtitan-amd/tree/main) of `torchtitan` for AMD GPUs.
-- [2025/10] We released `torchtitan` [v0.2.0](https://github.com/pytorch/torchtitan/releases).
-- [2025/10] SkyPilot now supports `torchtitan`! See the tutorial [here](https://docs.skypilot.co/en/latest/examples/training/torchtitan.html).
-- [2025/07] We published [instructions](/torchtitan/models/README.md) on how to add a model to `torchtitan`.
-- [2025/04] Our paper was accepted by [ICLR 2025](https://iclr.cc/virtual/2025/poster/29620).
-- [2024/12] GPU MODE [lecture](https://www.youtube.com/watch?v=VYWRjcUqW6w) on torchtitan.
-- [2024/07] [Presentation](https://pytorch2024.sched.com/event/1fHn3) at PyTorch Conference 2024.
-
-
-## Overview
-
-`torchtitan` is a PyTorch native platform designed for **rapid experimentation and large-scale training** of generative AI models. As a minimal clean-room implementation of PyTorch native scaling techniques, `torchtitan` provides a flexible foundation for developers to build upon. With `torchtitan` [extension points](docs/extension.md), one can easily create custom extensions tailored to specific needs.
-
-Our mission is to accelerate innovation in the field of generative AI by empowering researchers and developers to explore new modeling architectures and infrastructure techniques.
-
-The Guiding Principles when building `torchtitan`
-* Designed to be easy to understand, use and extend for different training purposes.
-* Minimal changes to the model code when applying multi-dimensional parallelism.
-* Bias towards a clean, minimal codebase while providing basic reusable / swappable components.
-
-`torchtitan` has been showcasing PyTorch's latest distributed training features, via support for pretraining Llama 3.1 LLMs of various sizes.
-
-## Contributing
-
-We look forward to your contributions!
-
-* To accelerate contributions to and innovations around torchtitan, we host an [`experiments`](torchtitan/experiments) folder. New ideas should start there. To contribute, follow the [`experiments guidelines`](torchtitan/experiments/README.md).
-* For fixes and contributions to core, follow these [`guidelines`](CONTRIBUTING.md).
-
-## Llama 3.1 training
-
-### Key features available
-
-1. Multi-dimensional composable parallelisms
-   - [FSDP2](docs/fsdp.md) with per-parameter sharding
-   - [Tensor Parallel](https://pytorch.org/docs/stable/distributed.tensor.parallel.html) (including [async TP](https://discuss.pytorch.org/t/distributed-w-torchtitan-introducing-async-tensor-parallelism-in-pytorch/209487))
-   - [Pipeline Parallel](https://discuss.pytorch.org/t/distributed-w-torchtitan-training-with-zero-bubble-pipeline-parallelism/214420)
-   - [Context Parallel](https://discuss.pytorch.org/t/distributed-w-torchtitan-breaking-barriers-training-long-context-llms-with-1m-sequence-length-in-pytorch-using-context-parallel/215082)
-2. [Meta device](https://pytorch.org/docs/stable/meta.html) initialization
-3. Per-op selective and full activation checkpointing
-4. [Distributed checkpointing](https://discuss.pytorch.org/t/distributed-w-torchtitan-optimizing-checkpointing-efficiency-with-pytorch-dcp/211250) (including async checkpointing)
-   - [Interoperable checkpoints](docs/checkpoint.md) which can be loaded directly into [`torchtune`](https://github.com/pytorch/torchtune) for fine-tuning
-5. `torch.compile` support
-6. [Float8](https://discuss.pytorch.org/t/distributed-w-torchtitan-enabling-float8-all-gather-in-fsdp2/209323) support ([how-to](torchtitan/components/quantization/float8.md))
-7. [MXFP8 training for dense and MoE models](torchtitan/components/quantization/mxfp8.md) on Blackwell GPUs.
-8. Supervised Fine-Tuning (SFT) with chat-formatted datasets
-9. DDP and HSDP
-10. [TorchFT](https://github.com/pytorch/torchft) integration
-11. Checkpointable data-loading, with the C4 dataset pre-configured (144M entries) and support for [custom datasets](docs/datasets.md)
-12. Gradient accumulation, enabled by giving an additional `--training.global_batch_size` argument on the CLI
-13. Flexible learning rate scheduler (warmup-stable-decay)
-14. [BF16 optimizer states](docs/bf16_optimizer_states.md) for reduced memory usage
-15. Loss, GPU memory, throughput (tokens/sec), TFLOPs, and MFU displayed and logged via [Tensorboard or Weights & Biases](/docs/metrics.md)
-16. [Debugging tools](docs/debugging.md) including CPU/GPU profiling, memory profiling, Flight Recorder, etc.
-17. All options easily configured via [Python config registry](torchtitan/models/llama3/config_registry.py) with `--module` and `--config` CLI flags
-18. Structured logging: per-rank trace of key training phases; (see [`torchtitan/observability/structured_logger/README.md`](torchtitan/observability/structured_logger/README.md))
-19. [Helper scripts](scripts/) to
-    - download tokenizers from Hugging Face
-    - convert original Llama 3 checkpoints into the expected DCP format
-    - estimate FSDP/HSDP memory usage without materializing the model
-    - run distributed inference with Tensor Parallel
-
-We report [performance](benchmarks/llama3_h100_202412_torchtitan.md) on up to 512 GPUs, and verify [loss converging](docs/converging.md) correctness of various techniques.
-
-### Dive into the code
-
-You may want to see how the model is defined or how parallelism techniques are applied. For a guided tour, see these files first:
-* [torchtitan/train.py](torchtitan/train.py) - the main training loop and high-level setup code
-* [torchtitan/models/llama3/model.py](torchtitan/models/llama3/model.py) - the Llama 3.1 model definition
-* [torchtitan/models/llama3/parallelize.py](torchtitan/models/llama3/parallelize.py) - helpers for applying Data Parallel, Tensor Parallel, activation checkpointing, and `torch.compile` to the model
-* [torchtitan/distributed/pipeline_parallel.py](torchtitan/distributed/pipeline_parallel.py) - helpers for applying Pipeline Parallel to the model
-* [torchtitan/components/checkpoint.py](torchtitan/components/checkpoint.py) - utils for saving/loading distributed checkpoints
-* [torchtitan/components/quantization/float8.py](torchtitan/components/quantization/float8.py) - utils for applying Float8 techniques
-
-
-## Installation
-
-One can directly run the source code, or install `torchtitan` from a nightly build, or a stable release.
-
-### From source
-
-This method requires the nightly build of PyTorch, or the latest PyTorch built [from source](https://github.com/pytorch/pytorch?tab=readme-ov-file#from-source).
+Before you start, install and verify `torch-neuronx` on a Trn2 or Trn3 instance by following [Quickstart: Install and verify torch-neuronx](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/torch/get-started/quickstart-torch-neuron.html). Then install this fork:
 
 ```bash
-git clone https://github.com/pytorch/torchtitan
-cd torchtitan
+git clone https://github.com/aws-neuron/torchtitan-neuron.git
+cd torchtitan-neuron
+git checkout release_2.33.0
 pip install -r requirements.txt
-pip install --pre torchdata --index-url https://download.pytorch.org/whl/nightly/cpu
+pip install -e .
 ```
 
-> **Note:** The nightly build of `torchdata` is required when using a PyTorch nightly. Install it from the nightly index as shown above.
-
-### Nightly builds
-
-This method requires the nightly build of PyTorch. You can replace `cu130` with another version of cuda or an AMD GPU (e.g. `rocm6.3`).
-
-```sh
-pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130 --force-reinstall
-pip install --pre torchtitan --index-url https://download.pytorch.org/whl/nightly/cu130
-```
-
-### Stable releases
-One can install the latest [stable release](https://github.com/pytorch/torchtitan/releases) of `torchtitan` via `pip` or `conda`.
-```sh
-pip install torchtitan
-```
-```sh
-conda install conda-forge::torchtitan
-```
-Note that each stable release pins the nightly versions of `torch` and `torchao`. Please see [release.md](docs/release.md) for more details.
-
-### Downloading a tokenizer
-
-`torchtitan` currently supports training Llama 3.1 (8B, 70B, 405B) out of the box. To get started training these models, we need to download the tokenizer. Follow the instructions on the official [meta-llama](https://huggingface.co/meta-llama/Llama-3.1-8B) repository to ensure you have access to the Llama model weights.
-
-Once you have confirmed access, you can run the following command to download the Llama 3.1 tokenizer to your local machine.
+Run a short verification on one `trn2.48xlarge` (64 logical NeuronCores, TP4 × FSDP16) using the bundled test tokenizer and dataset:
 
 ```bash
-# Get your HF token from https://huggingface.co/settings/tokens
-
-# Llama 3.1 tokenizer
-python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer --hf_token=...
+NGPU=64 MODULE=torchtitan_neuron.models.qwen3 CONFIG=qwen3_8b_tp4_fsdp16_sac \
+  ./run_train.sh --training.steps 10 --metrics.log_freq 1 \
+  --dataloader.dataset c4_test --hf_assets_path=./tests/assets/tokenizer
 ```
 
-### Start a training run
-Llama 3 8B model locally on 8 GPUs
+## Documentation
 
-```bash
-MODULE=llama3 CONFIG=llama3_8b ./run_train.sh
+- [What is TorchTitan Neuron?](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/training/torchtitan/about-torchtitan-neuron.html)
+- [Set up TorchTitan Neuron](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/training/torchtitan/get-started/setup-torchtitan-neuron.html)
+- [TorchTitan Neuron tutorials](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/training/torchtitan/tutorials/index.html)
+- [Release notes](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/components/torchtitan-neuron.html)
+
+### Repository guides
+
+Start with the [Neuron package overview](torchtitan_neuron/README.md) for the
+package boundary, layout, included components, and recipe selection.
+
+| Topic | Guide |
+| --- | --- |
+| Dense Qwen3 and Llama3 training | [Dense model tutorials](torchtitan_neuron/docs/dense-tutorials.md) |
+| Qwen3, DeepSeek-V3, and GPT-OSS MoE training | [MoE model tutorials](torchtitan_neuron/docs/moe-tutorials.md) |
+| Qwen3 NKI mixture-of-experts recipes | [Qwen3 NKI MoE](torchtitan_neuron/docs/qwen3_nki_moe.md) |
+| Full Qwen3-235B-A22B training | [Four-node Trainium3 UltraServer guide](torchtitan_neuron/docs/qwen3_235b_full_ep128.md) |
+| Qwen3 inference with `torch.compile` | [Qwen3 inference](torchtitan_neuron/docs/qwen3_inference.md) |
+| Neuron extension test suite | [Testing `torchtitan_neuron`](torchtitan_neuron/tests/README.md) |
+
+## Issues
+
+Report problems with running on Neuron or Trainium in this repository's [issues](https://github.com/aws-neuron/torchtitan-neuron/issues). Report problems that also occur on upstream torchtitan to [pytorch/torchtitan](https://github.com/pytorch/torchtitan/issues).
+
+## Package layout
+
+The Neuron-specific recipes, NKI kernel integrations, and docs are in
+[`torchtitan_neuron/`](torchtitan_neuron/README.md):
+
+```text
+torchtitan_neuron/
+|-- models/       Neuron modules and Trainer configuration registries
+|-- experiments/  GraphTrainer configuration registries
+|-- components/   Neuron-specific reusable components
+|-- docs/         AWS Neuron documentation
+`-- tests/        Neuron kernel, Trainer, and GraphTrainer tests
 ```
-
-### Multi-Node Training
-For training on ParallelCluster/Slurm type configurations, you can use the `multinode_trainer.slurm` file to submit your sbatch job.
-
-To get started adjust the number of nodes and GPUs
-```
-#SBATCH --ntasks=2
-#SBATCH --nodes=2
-```
-
-Then start a run where `nnodes` is your total node count, matching the sbatch node count above.
-
-```
-srun torchrun --nnodes 2
-```
-
-If your gpu count per node is not 8, adjust `--nproc_per_node` in the torchrun command and `#SBATCH --gpus-per-task` in the SBATCH command section.
-
 
 ## Citation
 
