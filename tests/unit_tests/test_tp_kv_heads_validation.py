@@ -16,14 +16,6 @@ import unittest
 from types import SimpleNamespace
 
 try:
-    import sys
-    from unittest.mock import MagicMock
-
-    # triton is Linux-only; stub it so MoE kernel imports don't crash on Windows
-    if "triton" not in sys.modules:
-        sys.modules["triton"] = MagicMock()
-        sys.modules["triton.language"] = MagicMock()
-
     from torchtitan.config import ParallelismConfig
     from torchtitan.models.common import (
         ComplexRoPE,

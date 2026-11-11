@@ -6,8 +6,10 @@
 
 import unittest
 
+import pytest
 import torch
-import triton.language as tl
+
+tl = pytest.importorskip("triton.language")
 
 from torchtitan.distributed.minimal_async_ep.kernels import (
     _copy_rows_to_peer_ptrs_kernel,

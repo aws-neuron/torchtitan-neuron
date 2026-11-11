@@ -53,9 +53,10 @@ from dataclasses import dataclass, replace
 
 import spmd_types as spmd
 import torch
-import triton
-import triton.language as tl
 
+# Without triton, triton_compat's jit stubs raise only when a kernel is launched,
+# so this module still imports.
+from torch._inductor.runtime.triton_compat import tl, triton
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.experimental import local_map
 

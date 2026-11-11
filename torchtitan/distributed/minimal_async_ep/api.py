@@ -28,16 +28,21 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
-from torchtitan.distributed.minimal_async_ep.kernels import (
-    copy_full_counts_to_peers_kernel,
-    copy_rows_to_peers_kernel,
-    expand_topk_grad_kernel,
-    fill_combine_metadata_kernel,
-    fill_dispatch_metadata_kernel,
-    invert_flat_indices_kernel,
-    reduce_topk_slots_kernel,
-    topk_scores_grad_kernel,
-)
+try:
+    from torchtitan.distributed.minimal_async_ep.kernels import (
+        copy_full_counts_to_peers_kernel,
+        copy_rows_to_peers_kernel,
+        expand_topk_grad_kernel,
+        fill_combine_metadata_kernel,
+        fill_dispatch_metadata_kernel,
+        invert_flat_indices_kernel,
+        reduce_topk_slots_kernel,
+        topk_scores_grad_kernel,
+    )
+except ImportError:
+    # No triton: the shared model code imports this module, but the CUDA-only
+    # kernels are never launched.
+    pass
 from torchtitan.tools.logging import logger
 
 
