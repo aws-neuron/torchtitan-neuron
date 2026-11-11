@@ -9,3 +9,7 @@ Holds Neuron-specific kernels, ops, and configs (e.g. NKI MoE) kept out of
 core torchtitan. Neuron recipes select them by converting the stock model
 config (for example ``to_nki_moe_config`` for each model's NKI MoE).
 """
+
+# Import torch before spmd_types: importing spmd_types first makes the torch_neuronx
+# autoload re-import the partially initialized spmd_types (circular import).
+import torch  # noqa: F401, E402
