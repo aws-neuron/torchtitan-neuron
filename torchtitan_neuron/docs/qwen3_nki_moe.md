@@ -41,6 +41,39 @@ python -m torchtitan.train \
   --hf_assets_path=./assets/hf/Qwen3-30B-A3B
 ```
 
+## Expert parallelism
+
+The NKI MoE supports expert parallelism with
+`--parallelism.expert_parallel_degree=N` (and `tensor_parallel_degree=1`).
+The routed expert weights are sharded on the expert dimension over the `ep`
+mesh, so each EP rank holds `num_experts / N` whole experts at the full expert
+hidden dimension. The router, the expert-bias state and the rest of the model
+are unchanged.
+
+Each rank routes its own tokens. `NKIGroupedExperts` all-gathers the tokens
+and their routing scores over the EP group, runs the blockwise NKI kernels on
+the rank's local experts, and reduce-scatters the partial outputs back to the
+ranks that own the tokens. There is no token permutation or all-to-all, and
+every shape is static. `qwen3_30b_a3b_nki_ep4_fullac_eager` is the eager
+recipe with `expert_parallel_degree=4`:
+
+```bash
+python -m torchtitan.train \
+  --module torchtitan_neuron.models.qwen3.config_registry \
+  --config qwen3_30b_a3b_nki_ep4_fullac_eager \
+  --hf_assets_path=./assets/hf/Qwen3-30B-A3B
+```
+
+By default the kernels size their block budget for the worst case, where every
+gathered row hits `top_k` local experts. A row hits about
+`top_k * local_experts / num_experts` local experts on average, so the worst
+case allocates up to `N` times more blocks than the routing uses. Setting
+`NKIGroupedExperts.Config.capacity_factor` (for example `1.5`) sizes the
+budget for that many times the expected routed rows per EP rank. Blocks are
+still assigned from the actual per-expert counts; if a step routes more rows to
+a rank than its budget holds, the rows beyond the budget skip those experts, as
+with a capacity factor.
+
 ## GraphTrainer recipe
 
 The GraphTrainer recipe uses SimpleFSDP and Neuron JIT compilation:

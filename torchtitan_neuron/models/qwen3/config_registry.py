@@ -162,6 +162,13 @@ def qwen3_30b_a3b_nki_fullac_compile() -> Trainer.Config:
     )
 
 
+def qwen3_30b_a3b_nki_ep4_fullac_eager() -> Trainer.Config:
+    """NKI MoE with expert parallelism: each group of 4 ranks shards the experts."""
+    config = qwen3_30b_a3b_nki_fullac_eager()
+    config.parallelism.expert_parallel_degree = 4
+    return config
+
+
 def qwen3_235b_a22b_neuron() -> Trainer.Config:
     """Full-scale Qwen3-235B Neuron recipe."""
     config = qwen3_235b_a22b()

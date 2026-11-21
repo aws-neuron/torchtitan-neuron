@@ -481,3 +481,211 @@ class TestNKIMoERouterGradUnderTP4(TestNKIMoERouterGradUnderTP):
     @property
     def world_size(self) -> int:
         return 4
+
+
+def test_num_blocks_keeps_the_worst_case_budget_by_default():
+    block = nki_moe.BLOCK_SIZE
+    assert nki_moe._num_blocks(4096, 128, 8, block) == 4096 * 8 // block + 128
+    # At most one affinity per row and expert.
+    assert nki_moe._num_blocks(4096, 4, 8, block) == 4096 * 4 // block + 4
+    # A capacity at or above the worst case changes nothing.
+    assert nki_moe._num_blocks(4096, 32, 8, block, 8.0) == (
+        nki_moe._num_blocks(4096, 32, 8, block)
+    )
+
+
+def test_num_blocks_capacity_bound_shrinks_the_expert_parallel_budget():
+    block = nki_moe.BLOCK_SIZE
+    # EP=4 of 128 experts with top-8 routing: 2 local affinities per row on
+    # average, 3 with a 1.5 capacity factor, instead of the worst-case 8.
+    tokens, local_experts = 16384, 32
+    worst = nki_moe._num_blocks(tokens, local_experts, 8, block)
+    bounded = nki_moe._num_blocks(tokens, local_experts, 8, block, 1.5 * 8 / 4)
+    assert worst == 16384 * 8 // block + 32
+    assert bounded == 16384 * 3 // block + 32
+    # A single expert keeps one row per block slot for every token.
+    assert nki_moe._num_blocks(tokens, 1, 8, block, 0.25) == (
+        nki_moe._num_blocks(tokens, 1, 8, block)
+    )
+
+
+def test_drop_over_capacity_is_a_no_op_when_the_routing_fits():
+    torch.manual_seed(0)
+    scores = torch.rand(64, 4) * (torch.rand(64, 4) < 0.3)
+    blocks = ((scores != 0).sum(dim=0) + 7) // 8
+    budget = int(blocks.clamp(min=1).sum())
+    torch.testing.assert_close(
+        nki_moe._drop_over_capacity(scores, budget, block_size=8), scores
+    )
+
+
+def test_drop_over_capacity_fits_the_block_budget():
+    block = 4
+    scores = torch.zeros(12, 3)
+    scores[:, 0] = 1.0  # 12 rows: 3 blocks
+    scores[::3, 1] = 0.5  # 4 rows: 1 block
+    scores[:5, 2] = 0.25  # 5 rows: 2 blocks
+    kept = nki_moe._drop_over_capacity(scores, num_blocks=4, block_size=block)
+
+    # Expert 0 keeps 2 blocks (one is reserved for each later expert); expert 1
+    # fits in its block; expert 2 gets the last block.
+    torch.testing.assert_close(kept[:8, 0], torch.ones(8))
+    torch.testing.assert_close(kept[8:, 0], torch.zeros(4))
+    torch.testing.assert_close(kept[:, 1], scores[:, 1])
+    torch.testing.assert_close(kept[:4, 2], scores[:4, 2])
+    torch.testing.assert_close(kept[4:, 2], torch.zeros(8))
+    blocks = ((kept != 0).sum(dim=0) + block - 1) // block
+    assert int(blocks.clamp(min=1).sum()) <= 4
+
+
+def _dense_moe_fake_nki_fwd(
+    hidden_states,
+    masked_scores,
+    gate_up_proj_weight,
+    down_proj_weight,
+    top_k,
+    block_size,
+    capacity_affinities_per_row=0.0,
+):
+    """Exact SwiGLU MoE over the experts passed in (CPU stand-in for the kernel)."""
+    del top_k, block_size, capacity_affinities_per_row
+    gate = torch.einsum("bd,edh->beh", hidden_states, gate_up_proj_weight[:, :, 0])
+    up = torch.einsum("bd,edh->beh", hidden_states, gate_up_proj_weight[:, :, 1])
+    expert_output = torch.einsum("beh,ehd->bed", F.silu(gate) * up, down_proj_weight)
+    output = torch.einsum("be,bed->bd", masked_scores, expert_output)
+    tokens, num_experts = masked_scores.shape
+    return (None,) * 5 + (tokens, num_experts, output)
+
+
+class TestNKIMoEExpertParallel(DTensorTestBase):
+    """EP shards whole experts; outputs and every gradient must match EP=1."""
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @property
+    def device_type(self) -> str:
+        return "cpu"
+
+    def _moe(self, *, enable_ep: bool):
+        config = nki_moe.NKIMoE.Config(
+            num_experts=_ROUTER_GRAD_NUM_EXPERTS,
+            load_balance_coeff=None,
+            router=nki_moe.MaskedScoresTopKRouter.Config(
+                gate=Linear.Config(
+                    in_features=_ROUTER_GRAD_DIM,
+                    out_features=_ROUTER_GRAD_NUM_EXPERTS,
+                    bias=False,
+                ),
+                top_k=_ROUTER_GRAD_TOP_K,
+                score_func="softmax",
+                route_norm=True,
+            ),
+            experts=nki_moe.NKIGroupedExperts.Config(
+                dim=_ROUTER_GRAD_DIM,
+                hidden_dim=_ROUTER_GRAD_HIDDEN_DIM,
+                num_experts=_ROUTER_GRAD_NUM_EXPERTS,
+                top_k=_ROUTER_GRAD_TOP_K,
+            ),
+        )
+        config.set_sharding_config(enable_sp=False, enable_ep=enable_ep)
+        torch.manual_seed(0)
+        moe = config.build()
+        with torch.no_grad():
+            for parameter in moe.parameters():
+                parameter.normal_(std=0.5)
+        return moe
+
+    @with_comms
+    def test_expert_parallel_matches_the_single_rank_reference(self):
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=self.world_size,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=self.world_size,
+            world_size=self.world_size,
+        )
+        with mock.patch(
+            "torchtitan.distributed.parallel_dims.device_type",
+            self.device_type,
+        ):
+            parallel_dims.build_mesh()
+
+        reference = self._moe(enable_ep=False)
+        moe = self._moe(enable_ep=True)
+        moe.parallelize(parallel_dims)
+
+        local_experts = _ROUTER_GRAD_NUM_EXPERTS // self.world_size
+        gate_up = moe.experts.gate_up_proj_weight
+        assert isinstance(gate_up, DTensor)
+        assert gate_up.to_local().shape[0] == local_experts
+        assert moe.experts.ep_mesh is not None
+
+        # Every rank owns different tokens (data parallel); the reference runs
+        # all of them on one rank with every expert.
+        torch.manual_seed(1)
+        shape = (
+            self.world_size * _ROUTER_GRAD_BATCH,
+            _ROUTER_GRAD_SEQ,
+            _ROUTER_GRAD_DIM,
+        )
+        inputs = torch.randn(shape)
+        output_grad = torch.randn(shape)
+        local = slice(
+            self.rank * _ROUTER_GRAD_BATCH, (self.rank + 1) * _ROUTER_GRAD_BATCH
+        )
+        reference_inputs = inputs.clone().requires_grad_()
+        ep_inputs = inputs[local].clone().requires_grad_()
+
+        with mock.patch.object(nki_moe, "nki_fwd", _dense_moe_fake_nki_fwd):
+            reference_output = reference(reference_inputs)
+            ep_output = moe(ep_inputs)
+        if isinstance(ep_output, DTensor):
+            ep_output = ep_output.to_local()
+        torch.testing.assert_close(ep_output, reference_output[local])
+
+        (reference_output * output_grad).sum().backward()
+        (ep_output * output_grad[local]).sum().backward()
+        assert ep_inputs.grad is not None and reference_inputs.grad is not None
+        torch.testing.assert_close(ep_inputs.grad, reference_inputs.grad[local])
+
+        # Expert gradients cover every rank's tokens for the rank's own experts.
+        first = self.rank * local_experts
+        experts = slice(first, first + local_experts)
+        for name in ("gate_up_proj_weight", "down_proj_weight"):
+            grad = getattr(moe.experts, name).grad
+            if isinstance(grad, DTensor):
+                grad = grad.to_local()
+            torch.testing.assert_close(
+                grad,
+                getattr(reference.experts, name).grad[experts],
+                msg=f"{name} gradient differs from the EP=1 reference",
+            )
+
+        # Router gradients are per-rank (data parallel) partial sums.
+        gate_grad = moe.router.gate.weight.grad
+        if isinstance(gate_grad, DTensor):
+            gate_grad = gate_grad.to_local()
+        torch.testing.assert_close(
+            torch.stack(_all_gather(gate_grad)).sum(dim=0),
+            reference.router.gate.weight.grad,
+        )
+
+
+class TestNKIMoEExpertParallel4(TestNKIMoEExpertParallel):
+    @property
+    def world_size(self) -> int:
+        return 4
+
+
+def test_expert_parallel_rejects_tensor_parallel_experts():
+    experts = nki_moe.NKIGroupedExperts(
+        nki_moe.NKIGroupedExperts.Config(dim=8, hidden_dim=16, num_experts=4, top_k=2)
+    )
+    parallel_dims = mock.MagicMock(ep_enabled=True, tp_enabled=True)
+    with mock.patch.object(nki_moe.Module, "parallelize"):
+        with pytest.raises(NotImplementedError, match="tensor_parallel_degree=1"):
+            experts.parallelize(parallel_dims)
