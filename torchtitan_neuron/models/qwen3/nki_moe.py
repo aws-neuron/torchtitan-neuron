@@ -5,6 +5,7 @@
 
 """Qwen3 NKI MoE implementation for the Neuron extension package."""
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -13,6 +14,7 @@ import nki.language as nl
 
 import spmd_types as spmd
 import torch
+import torch.distributed._functional_collectives as funcol
 import torch.nn.functional as F
 from nkilib.core.subkernels.find_nonzero_indices import find_nonzero_indices
 from nkilib.core.subkernels.indexed_flatten import indexed_flatten
@@ -46,6 +48,7 @@ from torchtitan.models.common.moe import (
     MoE,
     TokenChoiceTopKRouter,
 )
+from torchtitan.models.common.moe_sharding import expert_param_placement_sparse
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
@@ -84,6 +87,66 @@ def _single_expert_block_metadata(
     return token_position_to_id, block_to_expert
 
 
+def _num_blocks(
+    tokens: int,
+    num_experts: int,
+    top_k: int,
+    block_size: int,
+    capacity_affinities_per_row: float = 0.0,
+) -> int:
+    """Number of ``block_size``-row blocks the blockwise kernels run.
+
+    By default the budget covers the worst case: every row hits ``top_k`` of the
+    ``num_experts`` experts passed in (at most one affinity per expert and row).
+    For neuron_ep, ``num_experts`` counts the post-dispatch local experts.
+
+    A positive ``capacity_affinities_per_row`` sizes the budget for that many
+    affinities per row instead. Under expert parallelism a row hits about
+    ``top_k * local_experts / num_experts`` local experts, so the worst case
+    allocates up to ``ep_degree`` times more blocks than the routing needs, and
+    every padding block still costs DMA and matmul work. Blocks are still
+    assigned by each expert's actual row count; only routing beyond the total
+    budget is dropped (see ``_drop_over_capacity``).
+    """
+    affinities_per_row = min(top_k, num_experts)
+    # A single expert uses identity block metadata that must cover every row.
+    if num_experts > 1 and 0.0 < capacity_affinities_per_row < affinities_per_row:
+        return (
+            math.ceil(tokens * capacity_affinities_per_row / block_size) + num_experts
+        )
+    return (tokens * affinities_per_row + block_size - 1) // block_size + num_experts
+
+
+def _drop_over_capacity(
+    masked_scores: torch.Tensor,
+    num_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Zero the affinities that do not fit in ``num_blocks`` blocks.
+
+    Each expert needs ``ceil(rows / block_size)`` blocks (at least one). While
+    the experts' total fits in ``num_blocks`` nothing changes. Otherwise experts
+    are served in order: each keeps at most the blocks left after the experts
+    before it, minus one block reserved for every expert after it, and keeps its
+    first rows in token order. The other affinities are zeroed, so those rows
+    skip that expert, and the routing always fits the layout ``nki_fwd`` builds.
+    """
+    num_experts = masked_scores.shape[1]
+    # 1-based position of each routed row within its expert.
+    position = torch.cumsum((masked_scores != 0).to(torch.int32), dim=0)
+    blocks = ((position[-1] + block_size - 1) // block_size).clamp(min=1)
+    cum_blocks = torch.cumsum(blocks, dim=0)
+    # Greedy allocation in closed form: the blocks kept through expert e are
+    # min(cum_blocks[e], limit[j] + cum_blocks[e] - cum_blocks[j]) over j <= e,
+    # where limit[j] reserves one block for each expert after j.
+    limit = num_blocks - torch.arange(
+        num_experts - 1, -1, -1, device=masked_scores.device, dtype=cum_blocks.dtype
+    )
+    cum_kept = cum_blocks + torch.cummin(limit - cum_blocks, dim=0).values.clamp(max=0)
+    kept_blocks = torch.diff(cum_kept, prepend=cum_kept.new_zeros(1))
+    return masked_scores * (position <= kept_blocks * block_size)
+
+
 @nki_op("qwen3_nki_moe::nki_moe_fwd")
 def nki_fwd(
     hidden_states: torch.Tensor,
@@ -92,6 +155,7 @@ def nki_fwd(
     down_proj_weight: torch.Tensor,
     top_k: int,
     block_size: int,
+    capacity_affinities_per_row: float = 0.0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -105,12 +169,11 @@ def nki_fwd(
     tokens = hidden_states.shape[0]
     num_experts = masked_scores.shape[1]
     hidden_dim_tp = down_proj_weight.shape[1]
-    # At most one affinity can exist per local expert for a token row. For
-    # neuron_ep, masked_scores describes the post-dispatch local experts.
-    max_affinities_per_row = min(top_k, num_experts)
-    num_blocks = (
-        tokens * max_affinities_per_row + block_size - 1
-    ) // block_size + num_experts
+    num_blocks = _num_blocks(
+        tokens, num_experts, top_k, block_size, capacity_affinities_per_row
+    )
+    if num_blocks < _num_blocks(tokens, num_experts, top_k, block_size):
+        masked_scores = _drop_over_capacity(masked_scores, num_blocks, block_size)
 
     if num_experts == 1:
         # find_nonzero_indices requires the expert dimension to be divisible
@@ -242,6 +305,7 @@ def _setup_context(ctx, inputs, output):
         down_proj_weight,
         _,
         block_size,
+        *_,
     ) = inputs
     (
         affinities,
@@ -267,6 +331,7 @@ def _setup_context(ctx, inputs, output):
     ctx.num_experts = num_experts
     ctx.scores_dtype = masked_scores.dtype
     ctx.block_size = block_size
+    ctx.num_non_tensor_inputs = len(inputs) - 4
 
 
 def _backward(ctx, *grad_outputs):
@@ -325,8 +390,7 @@ def _backward(ctx, *grad_outputs):
         scores_grad,
         gate_up_proj_weight_grad,
         down_proj_weight_grad,
-        None,
-        None,
+        *(None,) * ctx.num_non_tensor_inputs,
     )
 
 
@@ -425,6 +489,20 @@ class MaskedScoresTopKRouter(Module):
 
 
 class NKIGroupedExperts(Module):
+    """Routed experts computed by the blockwise NKI MoE kernels.
+
+    Without expert parallelism, every rank sees the same (TP-replicated) tokens
+    and holds every expert, with TP sharding the expert hidden dimension.
+
+    With expert parallelism (``parallelism.expert_parallel_degree > 1``), the
+    expert weights are sharded on the expert dimension over the ``ep`` mesh and
+    each EP rank holds ``num_experts / ep`` whole experts. Each rank routes its
+    own tokens; the experts all-gather the tokens and their routing scores over
+    the EP group, run the kernels on the rank's local experts, and
+    reduce-scatter the partial outputs back to the ranks that own the tokens.
+    This needs no token permutation or all-to-all, and every shape is static.
+    """
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         dim: int
@@ -432,17 +510,47 @@ class NKIGroupedExperts(Module):
         num_experts: int
         top_k: int
         token_dispatcher: object | None = None
+        # Expert parallelism only: size the kernel's block budget for
+        # ``capacity_factor`` times the expected number of routed rows on this
+        # EP rank instead of the worst case. Routing beyond the budget is
+        # dropped. ``None`` keeps the worst-case (dropless) budget.
+        capacity_factor: float | None = None
 
     def __init__(self, config: Config):
         super().__init__()
         self.num_experts = config.num_experts
         self.top_k = config.top_k
+        if config.capacity_factor is not None and config.capacity_factor <= 0:
+            raise ValueError(
+                f"capacity_factor must be positive, got {config.capacity_factor}"
+            )
+        self.capacity_factor = config.capacity_factor
+        self.ep_mesh: DeviceMesh | None = None
+        self.ep_rank = 0
         self.gate_up_proj_weight = nn.Parameter(
             torch.empty(config.num_experts, config.dim, 2, config.hidden_dim)
         )
         self.down_proj_weight = nn.Parameter(
             torch.empty(config.num_experts, config.hidden_dim, config.dim)
         )
+
+    def parallelize(self, parallel_dims) -> None:
+        super().parallelize(parallel_dims)
+        if not parallel_dims.ep_enabled:
+            return
+        if parallel_dims.tp_enabled:
+            raise NotImplementedError(
+                "Qwen3 NKI MoE expert parallelism does not support tensor "
+                "parallelism; use tensor_parallel_degree=1."
+            )
+        ep_mesh = parallel_dims.get_mesh("ep")
+        if self.num_experts % ep_mesh.size() != 0:
+            raise ValueError(
+                f"num_experts ({self.num_experts}) must be divisible by "
+                f"expert_parallel_degree ({ep_mesh.size()})."
+            )
+        self.ep_mesh = ep_mesh
+        self.ep_rank = ep_mesh.get_local_rank()
 
     def forward(
         self,
@@ -454,6 +562,13 @@ class NKIGroupedExperts(Module):
         if isinstance(gate_up_proj_weight, DTensor):
             gate_up_proj_weight = gate_up_proj_weight.to_local()
             down_proj_weight = down_proj_weight.to_local()
+        if self.ep_mesh is not None:
+            return self._expert_parallel_forward(
+                hidden_states,
+                masked_scores,
+                gate_up_proj_weight,
+                down_proj_weight,
+            )
         (*_, tokens, _, output) = nki_fwd(
             hidden_states,
             masked_scores,
@@ -463,6 +578,47 @@ class NKIGroupedExperts(Module):
             BLOCK_SIZE,
         )
         return output[:tokens]
+
+    def _expert_parallel_forward(
+        self,
+        hidden_states: torch.Tensor,
+        masked_scores: torch.Tensor,
+        gate_up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        ep_mesh = self.ep_mesh
+        assert ep_mesh is not None
+        local_experts = gate_up_proj_weight.shape[0]
+        first_expert = self.ep_rank * local_experts
+
+        # Backward of the all-gathers is a reduce-scatter (sum) of the gradients,
+        # which returns each rank the gradient for its own tokens and scores.
+        hidden_states = funcol.all_gather_single_autograd(
+            hidden_states.contiguous(), 0, ep_mesh
+        )
+        masked_scores = funcol.all_gather_single_autograd(
+            masked_scores.contiguous(), 0, ep_mesh
+        )
+        local_scores = masked_scores[:, first_expert : first_expert + local_experts]
+
+        capacity_affinities_per_row = 0.0
+        if self.capacity_factor is not None:
+            capacity_affinities_per_row = (
+                self.capacity_factor * self.top_k * local_experts / self.num_experts
+            )
+        (*_, tokens, _, output) = nki_fwd(
+            hidden_states,
+            local_scores.contiguous(),
+            gate_up_proj_weight,
+            down_proj_weight,
+            self.top_k,
+            BLOCK_SIZE,
+            capacity_affinities_per_row,
+        )
+        # Sum the per-rank partial outputs and return each rank its own tokens.
+        return funcol.reduce_scatter_single_autograd(
+            output[:tokens].contiguous(), "sum", 0, ep_mesh
+        )
 
 
 class BWMMGroupedExperts(GroupedExperts):
@@ -556,9 +712,10 @@ class NKIMoE(Module):
         shared_experts: None = None
 
         def set_sharding_config(self, *, enable_sp: bool, enable_ep: bool) -> None:
-            if enable_ep:
-                raise NotImplementedError("Qwen3 NKI MoE supports TP-only experts")
-
+            # With expert parallelism only the expert weights are sharded (on
+            # the ep mesh); NKIGroupedExperts gathers the tokens over the EP
+            # group itself. EP requires tensor_parallel_degree=1, so the TP
+            # activation placements below resolve to no-ops.
             activation = (
                 dense_sequence_parallel_placement()
                 if enable_sp
@@ -586,10 +743,19 @@ class NKIMoE(Module):
                 out_src_shardings=replicated,
             )
             self.experts.sharding_config = ShardingConfig(
-                state_shardings={
-                    "gate_up_proj_weight": dense_param_placement(tp=spmd.S(3)),
-                    "down_proj_weight": dense_param_placement(tp=spmd.S(1)),
-                },
+                # Expert parallelism shards whole experts over the ep mesh;
+                # otherwise TP shards the expert hidden dimension.
+                state_shardings=(
+                    {
+                        "gate_up_proj_weight": expert_param_placement_sparse(),
+                        "down_proj_weight": expert_param_placement_sparse(),
+                    }
+                    if enable_ep
+                    else {
+                        "gate_up_proj_weight": dense_param_placement(tp=spmd.S(3)),
+                        "down_proj_weight": dense_param_placement(tp=spmd.S(1)),
+                    }
+                ),
                 in_src_shardings={
                     "hidden_states": replicated,
                     "masked_scores": replicated,
